@@ -1,7 +1,7 @@
 # FastLLM SM70 并发>1 优化搬运方案
 
 日期：2026-09-12  
-状态：待实施  
+状态：部分实施（见第 16 节「实施记录」）  
 范围：把 1Cat-vLLM 已录取的 **V100 / SM70、并发宽度 M=2–16** 算法搬进 FastLLM。不覆盖 MTP verifier 专用路径，也不搬纯 M=1 神优化。
 
 对照源：
@@ -685,3 +685,117 @@ PR0  batched Forward + cache=16 + 假图
 ## 15. 一句话
 
 并发>1 的 V100 收益不在 M=1 GEMV，而在 **先让 Qwen4 能组 batch，再把 M=2–32 的 QPN、MoE direct、small-N 和 TP4 push 塞进固定宽 CUDA Graph**。FastLLM 已有 TurboMind 桥、expert cache 和 custom AR，缺的是形状特化与 `batch>1` 的运行时。按 PR0→PR4 做完，C4–C16 有机会对齐 1Cat；PR5 只在长上下文或 Qwen3.8 细项上加分。
+
+---
+
+## 16. 实施记录
+
+### 16.1 已完成（可在单张 V100 上独立验证）
+
+**PR0 — MoE cache 容量（部分）**
+
+- `include/devices/cuda/fastllm-cuda.cuh`：`FASTLLM_CUDA_MOE_CACHE_MAX_BATCH` 由 `9` 提升到 `16`。
+  该常量同时是 `fastllm-moe-cache.cu::SupportedCacheInput` 的行数门控和
+  `qwen4_exp.cpp` 的图条件，因此放宽后 eager 路径可直接接受 C≤16 的
+  batched decode 输入。它只放宽「接受的行数」，不改变 device cache 的分配，
+  于是没有额外显存开销。
+- 该改动由既有 `test/basic/test_cuda_moe_cache.cu` 覆盖：测试用
+  `FASTLLM_CUDA_MOE_CACHE_MAX_BATCH` 自身构造 `MAX_BATCH` 与 `MAX_BATCH+1`
+  两侧边界，常量变化后断言依旧自洽。
+
+**PR1 — QPN8 FP8 内核地基（部分）**
+
+新增文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `include/devices/cuda/fastllm-sm70.cuh` | 对外 API：`Fp8QpnSupported / Fp8QpnCanRun / Fp8QpnPrepare / Fp8QpnGemm` |
+| `src/devices/cuda/sm70/qpn8_fp8.cu` | 去 Torch 化的 QPN8：prepack、scale 打包、主 kernel、M32 two-phase kernel |
+| `src/devices/cuda/sm70/LICENSE.v100-skinny` | 由 1Cat 原样拷贝的 MIT 许可 |
+| `test/ops/sm70QpnFp8Regression.cu` | 独立 FP32 oracle 回归 |
+| `CMakeLists.txt` | `qpn8_fp8.cu` 加入 `FASTLLM_CUDA_SOURCES`；注册 `sm70QpnFp8Regression` |
+
+去 Torch 化的边界：1Cat 源文件中 `fp8x8_to_half2x4_fast`、`qpn8_*_from_*`
+布局映射、`fp8_qpn8_sm70_kernel`、`fp8_qpn8_m32_twophase_sm70_kernel` 与两个
+`launch_*` 均为纯 CUDA，**原样保留**；只有 host 层的 `torch::Tensor` 包装被
+重写为裸指针。被排除的 `gated_pair` / `ba_split` / `hc_*` 属于 Qwen 专用融合
+路径，不在 PR1 范围。
+
+**语义要点（接入时必须知道）**：QPN8 的 FP8 解码器输出的是真值的 `1/256`，
+而 `Prepare` 里把 scale 乘了 `256`，两者相消，因此对外可见结果就是普通的
+dequant 语义 `out = in @ (fp8_value * scale)`。回归测试正是按这个口径校验的。
+
+验证（本机 4×V100-SXM2-16GB，CUDA 12.8）：
+
+```bash
+cmake -S . -B build-sm70-tests -DUSE_CUDA=ON -DCUDA_ARCH=70 -DUNIT_TEST=ON
+cmake --build build-sm70-tests --target sm70QpnFp8Regression -j8
+CUDA_VISIBLE_DEVICES=0 ./build-sm70-tests/sm70QpnFp8Regression
+```
+
+8 个用例全部通过，rel L2 稳定在 `3.4e-4 ~ 4.0e-4`（half 输出量化极限）：
+
+```
+[block_m1]        m=1  k=256  n=256   relL2=3.971e-04 OK
+[block_m4]        m=4  k=256  n=256   relL2=3.827e-04 OK
+[block_m8]        m=8  k=128  n=256   relL2=3.490e-04 OK
+[chan_m16]        m=16 k=256  n=256   relL2=3.367e-04 OK
+[chan_m32]        m=32 k=256  n=256   relL2=3.535e-04 OK
+[chan_m16_k64]    m=16 k=64   n=256   relL2=3.473e-04 OK
+[block_m4_hidden] m=4  k=2560 n=2560  relL2=3.522e-04 OK
+[chan_m16_down]   m=16 k=5120 n=2560  relL2=3.461e-04 OK
+```
+
+覆盖了 block-128 与 channel 两种 scale 布局、M=1/4/8/16/32 三个 kernel 分支、
+以及真实 Qwen3.8-Flash-Next 投影形状。回滚开关同样被测：设
+`FASTLLM_SM70_FP8_QPN8=0` 后 `Fp8QpnSupported()` 必须为 false。
+
+### 16.2 未完成（需要 32GB V100 + 完整模型才能验证，本轮刻意未盲改）
+
+**PR0 主体：batched `ForwardBatch`**
+
+`qwen4_exp.cpp` 的 `batch==1` 假设不止一处断言，而是散落在
+`ForwardTarget`（1000+ 行）、QSA、GDN、HyperConnection、KV append 与
+CUDA Graph 的 `graphSequence` 语义里。方案第 8 节估计为 1–1.5 周，且必须用
+真实 Qwen3.8-Flash-Next 验证数值。本机为 4×V100-**16GB**（方案假设 32GB），
+模型装不下，无法端到端验证，因此不在本轮盲改。
+
+同样未动的还有 `wholeGraphReady` 的 `graphSequence == 1` 条件：把它放宽到
+`{1,2,4,8,16}` 会连带改变 KV page append 的 stride、indexer tail 块数、
+QSA mask 与 position 假设，风险等级与主体改动相同。
+
+**PR1 接入：`fastllm-linear-fp8.cu` 的 QPN 优先分发**
+
+接入已设计清楚，但**未实施**，原因是它触碰 FP8 权重的生命周期，而这一点在
+无模型环境下无法验证。设计与风险如下，供后续实施：
+
+1. `codes` 是 `[K, N]` uint8，与 FastLLM 的 `[N, K]` FP8 `cudaData` 同为
+   `N*K` 字节，可**原地**转换：先 prepack 到临时 buffer，再拷回 `cudaData`，
+   释放临时 buffer。这样 prepare 后不双份常驻，符合方案第 11 节的内存中性目标。
+2. `groupScales`（`(K/128)*(N/32)` 个 half）需要新槽位。现布局是
+   `extraCudaData = [scales, bias]`，TurboMind prepare 后会 `push_back(nullptr)`
+   变成三槽并以 `back()==nullptr` 作为自己的标记。QPN 可把第三槽设为
+   `groupScales`（非空），于是两条路径天然互斥：TurboMind 的 prepare 会因
+   `back()!=nullptr` 安全拒绝。
+3. **必须同步修改 `FastllmCudaFp8E4M3HasSm70Layout`**：它现在只看
+   `IsRepacked && extraCudaData[0] != nullptr`，QPN 准备后会被误判为 TurboMind
+   layout 进而用错 GEMM。
+4. **风险最高的点**：一旦原地改写 `cudaData`，所有读 FP8 权重的路径都必须
+   知道新 layout。当前至少有三条：`FastllmCudaHalfMatMulFloatFP8E4M3`（FP16）、
+   `FastllmCudaMatMulFloatFP8E4M3`（FP32，会退回 dequant+cuBLAS 或 GEMV）、
+   `FastllmCudaBFloat16MatMulFloatFP8E4M3`（BF16）。漏掉任何一条，权重会被
+   当成 `[N, K]` 直接解码，得到**数值错误而非崩溃**，极难定位。接入时必须
+   为这三条路径统一加 QPN 分支，并补一条覆盖三种 activation 类型的单测。
+5. prepare 时机仍应放在 warmup（`FastllmCudaWarmupFp8E4M3Sm70`），并复用现有
+   `try_to_lock` 避免 TP 死锁（回归见 `fp8TpRepackDeadlockRegression`）。
+
+**未搬的内核**：QPN2/QPN4 NVFP4（`nvfp4_qpn2_sm70.cu`、`nvfp4_qpn4_sm70.cu`）、
+MoE direct（PR2）、small-N / push AR（PR3）。它们的接入都依赖 PR0 的 batched
+运行时，在 PR0 主体完成前无法产生端到端收益。
+
+### 16.3 下一步建议
+
+1. 在 4×V100-**32GB** 上跑通 `--max_batch 4` 的 batched decode（PR0 主体），
+   先用 eager 验证数值，再打开固定宽 CUDA Graph。
+2. PR0 合入后按 16.2 的设计接 QPN8，并同步补 FP16/FP32/BF16 三条路径的单测。
+3. 之后按方案第 12 节顺序推进 PR2/PR3。

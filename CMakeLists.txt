@@ -433,6 +433,7 @@ if (USE_CUDA)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
         src/devices/cuda/awq_sm70/fastllm-awq-sm70.cu
         src/devices/cuda/awq_sm70/tm_registry_sm70.cu
+        src/devices/cuda/sm70/qpn8_fp8.cu
         ${TURBOMIND_ROOT}/core/check.cc
         ${TURBOMIND_ROOT}/core/layout.cc
         ${TURBOMIND_ROOT}/core/context.cc
@@ -847,6 +848,19 @@ if (UNIT_TEST)
         target_include_directories(nvfp4TpSplitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME nvfp4TpSplit COMMAND nvfp4TpSplitRegression)
         set_tests_properties(nvfp4TpSplit PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+        # SM70 QPN8 FP8 dense GEMM regression. Compiles the self-contained
+        # bridge directly (no full fastllm link) so it builds fast; skips on
+        # non-SM70 GPUs (exit 77).
+        add_executable(sm70QpnFp8Regression test/ops/sm70QpnFp8Regression.cu
+            src/devices/cuda/sm70/qpn8_fp8.cu)
+        target_include_directories(sm70QpnFp8Regression PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        set_target_properties(sm70QpnFp8Regression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME sm70QpnFp8 COMMAND sm70QpnFp8Regression)
+        set_tests_properties(sm70QpnFp8 PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
 
         add_executable(qwen4QSASelectRegression test/ops/qwen4QSASelectRegression.cpp)
         target_link_libraries(qwen4QSASelectRegression fastllm)

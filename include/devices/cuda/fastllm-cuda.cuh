@@ -1595,9 +1595,10 @@ struct FastllmCudaMoeCacheLayer {
     fastllm::Data *const *weights = nullptr;
     int weightsBatch = 0;
 };
-// One anchor plus up to eight speculative tokens. Larger prefill batches
-// keep using the configured MoE backend.
-constexpr int FASTLLM_CUDA_MOE_CACHE_MAX_BATCH = 9;
+// One anchor plus up to eight speculative tokens, or a batched decode width of
+// up to sixteen concurrent requests (SM70 concurrency port, PR0). Larger
+// prefill batches keep using the configured MoE backend.
+constexpr int FASTLLM_CUDA_MOE_CACHE_MAX_BATCH = 16;
 bool FastllmCudaMoeCacheRequested();
 // With a registration callback, retain only original metadata and borrow the
 // registered pinned NUMA weights through byte-layout views. No duplicate
