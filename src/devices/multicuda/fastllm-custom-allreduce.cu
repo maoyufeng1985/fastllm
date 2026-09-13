@@ -1036,6 +1036,19 @@ struct CustomArState {
     bool lastRegistrationMissDuringCapture = false;
     std::vector<void *> pendingInputs;
     std::vector<char> pendingCapturing;
+    // Pointer-local guard results (non-null and 16-byte aligned).  Unlike the
+    // byte size and dtype, a pointer's alignment can differ from rank to rank,
+    // so this must not be decided locally: every rank folds its own flag in
+    // here and the rendezvous makes the launch-or-fall-back decision
+    // collective.
+    // 43f78959: per-rank call ordinals identify WHICH tensor a peer is on.
+    // The pointer tuple alone pairs ranks by arrival order, so any asymmetry in
+    // the ranks' collective call streams shifts every later round (silent wrong
+    // results, or an out-of-range read of a freed peer buffer).
+    uint64_t rankCallSequence[kCustomArMaxRanks]{};
+    uint64_t pendingSequences[kCustomArMaxRanks]{};
+    bool sequenceDesyncLogged = false;
+    std::vector<char> pendingAligned;
     std::vector<CustomArRankData *> lastRankData;
 };
 
@@ -1363,6 +1376,7 @@ bool BuildCustomArRegistration(CustomArState &state,
 
 bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                                     void *input, int count, int dataType,
+                                    bool localEligible,
                                     CustomArRankData *&rankData) {
     // Registration is itself collective.  A local-pointer-only lookup is
     // unsafe because allocators can reuse an address on some ranks but not on
@@ -1387,6 +1401,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         state.pendingMismatch = false;
         state.pendingInputs.assign(state.devices.size(), nullptr);
         state.pendingCapturing.assign(state.devices.size(), 0);
+        state.pendingAligned.assign(state.devices.size(), 0);
     } else if (state.pendingCount != count || state.pendingType != dataType) {
         state.pendingMismatch = true;
     }
@@ -1396,6 +1411,8 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     } else {
         state.pendingInputs[rank] = input;
         state.pendingCapturing[rank] = capturing ? 1 : 0;
+        state.pendingAligned[rank] = localEligible ? 1 : 0;
+        state.pendingSequences[rank] = state.rankCallSequence[rank]++;
     }
     state.pendingMismatch = state.pendingMismatch || !captureQueryOk;
     state.arrived++;
@@ -1405,6 +1422,32 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         bool inputsValid = !state.pendingMismatch;
         for (void *ptr : inputs) {
             inputsValid = inputsValid && ptr != nullptr;
+        }
+        // Fold in every rank's local pointer-eligibility (non-null and 16-byte
+        // aligned).  A rank with an unusable local view must not have bailed
+        // out before arriving here: had it done so its peers would spin in this
+        // rendezvous, or in the device barrier, forever.  One bad rank now
+        // drops all ranks to NCCL together.
+        for (char eligible : state.pendingAligned) {
+            inputsValid = inputsValid && eligible != 0;
+        }
+        // A desynchronised call stream shifts the arrival-order pairing by
+        // one; refuse the round so it falls back to NCCL instead of
+        // reducing the wrong peer tensor (or reading a freed buffer).
+        for (int other = 1; other < (int)state.devices.size() && inputsValid;
+             ++other) {
+            if (state.pendingSequences[other] != state.pendingSequences[0]) {
+                inputsValid = false;
+                state.pendingMismatch = true;
+                if (rank == 0 && !state.sequenceDesyncLogged) {
+                    state.sequenceDesyncLogged = true;
+                    std::fprintf(stderr,
+                                 "[Fastllm] custom all-reduce call "
+                                 "sequences desynchronized across ranks; "
+                                 "falling back to NCCL.\n");
+                    std::fflush(stderr);
+                }
+            }
         }
         std::vector<uintptr_t> key;
         key.reserve(inputs.size());
@@ -1765,9 +1808,18 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
                           bool requireEnabledPath = false,
                           cudaStream_t stream = cudaStreamPerThread,
                           bool census = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  Whether *this* rank's pointers are usable is local information and
+    // must not be decided here: a rank that returned early would leave its
+    // peers waiting in the rendezvous (or in the device barrier) forever.
+    // Record the flag and let the collective rendezvous below drop every rank
+    // to NCCL together.
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1787,7 +1839,7 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData)) {
         CustomArCensusNote(kCensusPointerDeclined, bytes, census);
         return false;
     }
@@ -1880,10 +1932,17 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
                                  int count, int dataType, int deviceId,
                                  bool requireEnabledPath = false) {
-    if (first == nullptr || second == nullptr || dest == nullptr ||
-        count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads first/second and writes dest as 16-byte aligned
+    // packets; a misaligned or null view would fault on the device
+    // (cudaErrorMisalignedAddress, Xid 13).  This is local information, so it
+    // goes into the collective rendezvous rather than an early return (see
+    // RunCustomArCandidate).
+    const bool localEligible = first != nullptr && second != nullptr &&
+        dest != nullptr &&
+        (((uintptr_t)first | (uintptr_t)second | (uintptr_t)dest) & 15u) == 0;
     const size_t typeBytes = CustomArTypeBytes(dataType);
     const size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1902,9 +1961,11 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
     CustomArRankData *firstRankData = nullptr;
     CustomArRankData *secondRankData = nullptr;
     if (!FindOrRegisterCustomArPointers(
-            state, rank, first, count, dataType, firstRankData) ||
+            state, rank, first, count, dataType, localEligible,
+            firstRankData) ||
         !FindOrRegisterCustomArPointers(
-            state, rank, second, count, dataType, secondRankData)) {
+            state, rank, second, count, dataType, localEligible,
+            secondRankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -1928,9 +1989,15 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
 bool RunCustomArAddCandidate(void *data, void *dest, int count,
                              int dataType, int deviceId,
                              bool requireEnabledPath = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  This is local information, so it goes into the collective
+    // rendezvous rather than an early return (see RunCustomArCandidate).
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1949,7 +2016,7 @@ bool RunCustomArAddCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -2648,6 +2715,7 @@ void FastllmCudaCustomAllReduceReset() {
         state.autoModePublished = false;
         state.pendingInputs.clear();
         state.pendingCapturing.clear();
+        state.pendingAligned.clear();
         state.lastRankData.clear();
         state.generation++;
     }
