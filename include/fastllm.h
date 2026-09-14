@@ -517,6 +517,9 @@ namespace fastllm {
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
+        // SM70 NVFP4 QPN2 packed sidecar. Native/TurboMind layout stays in
+        // cudaData so prefill (M > 32) can keep the 1Cat large-M path.
+        void *nvfp4Qpn2Packed = nullptr;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
         // Set only when this object owns entries in the DeepSeek-V4 CUDA
         // route-table registry, so ordinary temporary tensors can skip the

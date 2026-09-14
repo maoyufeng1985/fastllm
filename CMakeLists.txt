@@ -434,6 +434,7 @@ if (USE_CUDA)
         src/devices/cuda/awq_sm70/fastllm-awq-sm70.cu
         src/devices/cuda/awq_sm70/tm_registry_sm70.cu
         src/devices/cuda/sm70/qpn8_fp8.cu
+        src/devices/cuda/sm70/qpn2_nvfp4.cu
         ${TURBOMIND_ROOT}/core/check.cc
         ${TURBOMIND_ROOT}/core/layout.cc
         ${TURBOMIND_ROOT}/core/context.cc
@@ -861,6 +862,16 @@ if (UNIT_TEST)
             CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME sm70QpnFp8 COMMAND sm70QpnFp8Regression)
         set_tests_properties(sm70QpnFp8 PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+        add_executable(sm70QpnNvfp4Regression test/ops/sm70QpnNvfp4Regression.cu
+            src/devices/cuda/sm70/qpn2_nvfp4.cu)
+        target_include_directories(sm70QpnNvfp4Regression PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        set_target_properties(sm70QpnNvfp4Regression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME sm70QpnNvfp4 COMMAND sm70QpnNvfp4Regression)
+        set_tests_properties(sm70QpnNvfp4 PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
 
         add_executable(qwen4QSASelectRegression test/ops/qwen4QSASelectRegression.cpp)
         target_link_libraries(qwen4QSASelectRegression fastllm)

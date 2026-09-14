@@ -1145,6 +1145,10 @@ namespace fastllm {
                     }
                     this->cudaData = nullptr;
                     this->cudaDataBorrowed = false;
+                    if (this->nvfp4Qpn2Packed != nullptr) {
+                        FastllmCudaFree(this->nvfp4Qpn2Packed);
+                        this->nvfp4Qpn2Packed = nullptr;
+                    }
 #endif
                 }
                 return;
@@ -2197,6 +2201,10 @@ namespace fastllm {
             this->cudaData = nullptr;
             this->cudaDataBorrowed = false;
         }
+        if (this->nvfp4Qpn2Packed != nullptr) {
+            FastllmCudaFree(this->nvfp4Qpn2Packed);
+            this->nvfp4Qpn2Packed = nullptr;
+        }
 #endif
     }
 
@@ -2382,6 +2390,10 @@ namespace fastllm {
                     FastllmCudaFree(this->cudaData);
                 }
             }
+        }
+        if (this->nvfp4Qpn2Packed != nullptr) {
+            FastllmCudaFree(this->nvfp4Qpn2Packed);
+            this->nvfp4Qpn2Packed = nullptr;
         }
 #endif
     }

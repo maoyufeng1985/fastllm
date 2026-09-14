@@ -750,6 +750,102 @@ CUDA_VISIBLE_DEVICES=0 ./build-sm70-tests/sm70QpnFp8Regression
 以及真实 Qwen3.8-Flash-Next 投影形状。回滚开关同样被测：设
 `FASTLLM_SM70_FP8_QPN8=0` 后 `Fp8QpnSupported()` 必须为 false。
 
+**PR1 — QPN2 NVFP4 内核地基（部分）**
+
+新增文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `include/devices/cuda/fastllm-sm70.cuh` | 追加 `Nvfp4QpnSupported / CanRun / Prepare / Gemm` |
+| `src/devices/cuda/sm70/qpn2_nvfp4.cu` | 去 Torch 化的 QPN2：prepack、主 kernel、M=9..16 two-row tile |
+| `test/ops/sm70QpnNvfp4Regression.cu` | 独立 FP32 oracle 回归 |
+| `CMakeLists.txt` | `qpn2_nvfp4.cu` 加入 `FASTLLM_CUDA_SOURCES`；注册 `sm70QpnNvfp4Regression` |
+
+去 Torch 化边界与 QPN8 相同：`qpn2_col_from_lane`、`qpn2_logical_k`、prepack kernel、
+`dequant_e2m1x8`、`nvfp4_qpn2_sm70_kernel` 与 `launch_qpn2` 原样保留；host 层
+`torch::Tensor` 改为裸指针。gated SiLU 融合不在本轮（Qwen3.5 dense decode 用不到）。
+
+验证（本机 4×V100-SXM2-16GB，CUDA 12.8）：
+
+```
+[m1]        m=1  k=256  n=256   relL2=2.120e-04 OK
+[m4]        m=4  k=256  n=256   relL2=2.108e-04 OK
+[m8]        m=8  k=128  n=256   relL2=2.086e-04 OK
+[m16]       m=16 k=256  n=256   relL2=2.123e-04 OK
+[m32]       m=32 k=256  n=256   relL2=2.092e-04 OK
+[m4_scale]  m=4  k=256  n=256   relL2=2.108e-04 OK
+[m4_k1536]  m=4  k=1536 n=256   relL2=2.082e-04 OK
+[m16_k512]  m=16 k=512  n=256   relL2=2.071e-04 OK
+```
+
+回滚开关：`FASTLLM_SM70_NVFP4_QPN2=0` 后 `Nvfp4QpnSupported()` 必须为 false。
+
+**端到端（本机已跑，Qwen3.8-27B-QUASAR-NVFP4，TP4，max_batch=4）**
+
+greedy、强制 64 token、短 prompt：
+
+| 并发 C | GEMV/TM 基线 单请求 | GEMV/TM 聚合 | QPN2 单请求 | QPN2 聚合 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 68.4 | 63.3 | **71.7** | 63.1 |
+| 4 | 69.6 | 247.6 | **71.8** | 246.5 |
+
+C=1 约 +5%。C=4 单请求同样略升，短 prompt 聚合被共同 TTFT 稀释。
+
+**官方 `ftllm benchmark`（同模型同二进制，已跑通）**
+
+```bash
+PYTHONPATH=/home/fastllm/build-sm70-tests/tools \
+python3 -m ftllm.cli benchmark /home/models/Qwen3.8-27B-QUASAR-NVFP4 \
+  --tp 4 --cuda_embedding --max_batch {1|4} --tokens 4096 \
+  --dtype auto --enable_thinking false \
+  --input_tokens 64 --output_tokens 64 --batch {1|4} \
+  --warmup 1 --temperature 0 --top_k 1
+```
+
+| batch | 实际输出 | TTFT | TPOP | Prefill | Batch decode after TTFT | Batch total | Per request |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 64/64 | 63.67 ms | 13.80 ms/tok | 1005 tok/s | **72.44 tok/s** | 68.57 | 68.57 |
+| 4 | 256/256 | 206.32 ms | 14.08 ms/tok | — | **283.66 tok/s** | 233.83 | 58.54 |
+
+官方口径的 `Batch decode after TTFT` 排除共同 TTFT，C=4 聚合 283.66 tok/s，高于 HTTP 短 prompt 的 247 tok/s。无 conversion error，输出长度打满。
+
+**长 prompt `ftllm benchmark`（greedy，256 out，`--prefix_cache false`）**
+
+```bash
+PYTHONPATH=/home/fastllm/build-sm70-tests/tools \
+python3 -m ftllm.cli benchmark /home/models/Qwen3.8-27B-QUASAR-NVFP4 \
+  --tp 4 --cuda_embedding --max_batch {1|4} --tokens {8192|16384|20480|32768|49152|167936|230400} \
+  --dtype auto --enable_thinking false --prefix_cache false \
+  --input_tokens {2048|4096|8192|81920|184320} --output_tokens 256 --batch {1|2|4} \
+  --warmup {0|1} --temperature 0 --top_k 1
+```
+
+| in | batch | 实际输出 | TTFT min–max | Decode after TTFT | Batch total | Per request |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 | 1 | 256/256 | 1.56 s | **71.78 tok/s** | — | — |
+| 2048 | 4 | 1024/1024 | 1.57–6.17 s | **123.35 tok/s** | — | — |
+| 4096 | 1 | 256/256 | 1.55 s | **71.87 tok/s** | — | — |
+| 4096 | 4 | 1024/1024 | 1.57–6.08 s | **123.61 tok/s** | — | — |
+| 8192 | 1 | 256/256 | 5.92 s | **70.35 tok/s** | — | — |
+| 8192 | 2 | 512/512 | 5.94–11.87 s | **53.58 tok/s** | 33.11 | 16.56 |
+| 8192 | 4 | 1024/1024 | 5.92–23.67 s | **47.14 tok/s** | 37.16 | 9.29 |
+| 81920 | 1 | 256/256 | 68.91 s | **59.98 tok/s** | 3.50 | 3.50 |
+| 81920 | 2 | 512/512 | 69.06–140.19 s | **6.72 tok/s** | 3.53 | 1.77 |
+| 184320 | 1 | 256/256 | 188.39 s | **50.13 tok/s** | 1.32 | 1.32 |
+
+C=4 8K 总墙钟 27.56 s。C=2 8K 总墙钟 15.46 s。C=2 80K 总墙钟 145.00 s。8K/80K prefill 基本串行入队（C=2 80K TTFT 69 / 140 s），decode 窗口被最后一条 TTFT 压短。`--max_batch 2 --batch 2` 会卡在 warmup；C=2 需用 `--max_batch 4 --batch 2`。80K 默认 `FASTLLM_PAGED_CUBLAS_CHUNK=8192` 会把 QK workspace 顶到约 1.3GB，16GB 卡上 GPU0 100%/52W 挂死；改 `FASTLLM_PAGED_CUBLAS_CHUNK=2048`、`--tokens 167936`、`--warmup 0` 后跑通。无新 Xid。
+
+**80K C=2 的 6.72 tok/s 不是真实 decode。** 官方 `Batch decode after TTFT` = `(2×255) / (t_end − min(TTFT))`，把第二条 80K prefill（69→140 s）整段算进 decode 窗口。拆开 TPOP：
+
+| 请求 | TTFT | 结束 | TPOP | 含义 |
+| ---: | ---: | ---: | ---: | --- |
+| #0 | 69.06 s | 145.00 s | 297.77 ms/tok | 出第一个 token 后被 #1 的 80K prefill 堵住 |
+| #1 | 140.19 s | 145.00 s | **18.81 ms/tok（53.2 tok/s）** | 两条都 prefill 完之后的稳态 decode |
+
+C=1 80K 已钉死稳态：**Prefill 1188.83 tok/s，Decode after TTFT 59.98 tok/s，TPOP 16.67 ms/tok**。相对 8K C=1 的 70.35 tok/s 只慢约 15%。C=2 第二条的 TPOP 18.81 ms/tok（53.2 tok/s）与 C=1 的 59.98 tok/s 同量级，差在两条共享 80K KV 的 decode 带宽。官方 C=2 的 6.72 tok/s 仍是被第二条 prefill 污染的口径。
+
+C=1 180K（`input_tokens=184320`）同样跑通：Prefill **978.40 tok/s**，Decode after TTFT **50.13 tok/s**，TPOP 19.95 ms/tok。相对 8K 慢约 29%，相对 80K 慢约 16%。KV 上限 230400（1800 pages），AddPrefill 1440 pages 刚好覆盖 180K，加载后单卡约 14.0 GB / 16 GB。无新 Xid。
+
 ### 16.2 未完成（需要 32GB V100 + 完整模型才能验证，本轮刻意未盲改）
 
 **PR0 主体：batched `ForwardBatch`**
@@ -789,13 +885,35 @@ QSA mask 与 position 假设，风险等级与主体改动相同。
 5. prepare 时机仍应放在 warmup（`FastllmCudaWarmupFp8E4M3Sm70`），并复用现有
    `try_to_lock` 避免 TP 死锁（回归见 `fp8TpRepackDeadlockRegression`）。
 
-**未搬的内核**：QPN2/QPN4 NVFP4（`nvfp4_qpn2_sm70.cu`、`nvfp4_qpn4_sm70.cu`）、
-MoE direct（PR2）、small-N / push AR（PR3）。它们的接入都依赖 PR0 的 batched
-运行时，在 PR0 主体完成前无法产生端到端收益。
+**未搬的内核**：QPN4 NVFP4（`nvfp4_qpn4_sm70.cu`）、MoE direct（PR2）、
+small-N / push AR（PR3）。QPN2 内核已落地，并已接入 Linear 分发（待重启服务验证吞吐）。
+
+**PR1 接入：`fastllm-linear-fp8.cu` 的 QPN2 优先分发（已落地）**
+
+接入点：`FastllmCudaHalfMatMulFloatNVFP4Block16` 在 TurboMind / Marlin / GEMV
+之前走 `FastllmCudaTryNVFP4Qpn2`。warmup（`NcclForceSync`）期间
+`Nvfp4QpnPrepareFromNative` 把 interleaved `[N, (K/16)*12]` 原地改写成
+`[codes | raw E4M3 scales]`：native FP32 scale 是 checkpoint E4M3 ×
+`weight.scales[0]`（即 `weight_scale_2` / `weight_global_scale`），prepare
+按同一 globalScale 反融合回 E4M3，GEMM 再乘一次，对齐 1Cat QPN2 契约。
+QPN2 用 `weight.groupCnt = 0x514E32` 标记，避免
+把 host sentinel 放进 `extraCudaHalfData`（`cudaFree` 会归到 GPU0，触发
+Xid 13/43）。TP shard 会复制 `groupCnt`。M>32 按 32 行切块，decode 与
+prefill 共用同一份 packed 权重。FP32 路径走 half adapter；BF16 明确拒绝。
+回滚：`FASTLLM_SM70_NVFP4_QPN2=0`（须在权重 prepare 之前设置）。
+
+native unpack 回归（`sm70QpnNvfp4Regression`）：
+
+```
+[native_m4]    m=4  k=256  n=256  relL2=2.080e-04 OK
+[native_m16]   m=16 k=256  n=256  relL2=2.057e-04 OK
+[native_m32]   m=32 k=256  n=256  relL2=2.058e-04 OK
+[native_k1536] m=4  k=1536 n=256  relL2=2.081e-04 OK
+```
 
 ### 16.3 下一步建议
 
-1. 在 4×V100-**32GB** 上跑通 `--max_batch 4` 的 batched decode（PR0 主体），
-   先用 eager 验证数值，再打开固定宽 CUDA Graph。
-2. PR0 合入后按 16.2 的设计接 QPN8，并同步补 FP16/FP32/BF16 三条路径的单测。
-3. 之后按方案第 12 节顺序推进 PR2/PR3。
+1. C=4 长 prompt 已测完到 8K：2048/4096 聚合约 123 tok/s，8K 因串行 prefill 掉到 47 tok/s，仍低于 1Cat 164 tok/s。下一步看 chunked prefill / 入队是否能并行。
+2. QPN8 FP8 按 16.2 接入 Linear（当前模型是 NVFP4，QPN8 需 FP8 权重才能端到端验证）。
+3. 在 4×V100-**32GB** 上跑通 Qwen4-Exp `--max_batch 4`（PR0 主体）。
+4. 之后按方案第 12 节顺序推进 QPN4 / MoE direct / push AR。

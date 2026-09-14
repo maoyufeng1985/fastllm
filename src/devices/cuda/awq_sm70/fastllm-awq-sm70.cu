@@ -70,6 +70,13 @@ struct DeviceRuntime {
     WorkspaceHolder workspace;
     std::mutex runMutex;
     std::set<DenseTuneKey> tunedShapes;
+    // Persistent padded-output scratch for NVFP4 GEMM. TurboMind requires N
+    // aligned to 32; when the logical width is not, each call used to
+    // FastllmCudaTryMalloc a tokens*packedN buffer and free it after the
+    // stream. That real cudaMalloc races in-flight NCCL AllReduce for the
+    // process-wide driver lock and deadlocks tensor-parallel ranks.
+    void *nvfp4Scratch = nullptr;
+    size_t nvfp4ScratchBytes = 0;
 };
 
 std::mutex g_prepareMutex;
@@ -985,23 +992,6 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
         return false;
     }
 
-    half *gemmOutput = out;
-    if (packedN != N) {
-        void *temporary = nullptr;
-        if (FastllmCudaTryMalloc(
-                &temporary, (size_t)tokens * packedN * sizeof(half)) !=
-            FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
-            return false;
-        }
-        gemmOutput = static_cast<half *>(temporary);
-    }
-    auto releaseTemporary = [&]() {
-        if (gemmOutput != out &&
-            !FastllmCudaFreeAfterStream(gemmOutput, stream)) {
-            FastllmCudaFree(gemmOutput);
-        }
-    };
-
     tm::MatrixLayout descA{
         turbomind::kHalf, tm::kRowMajor, tokens, K, K,
     };
@@ -1022,6 +1012,36 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
 
     DeviceRuntime &runtime = GetRuntime(device);
     std::lock_guard<std::mutex> runLock(runtime.runMutex);
+    half *gemmOutput = out;
+    if (packedN != N) {
+        const size_t scratchBytes = (size_t)tokens * packedN * sizeof(half);
+        size_t allocBytes = scratchBytes;
+        if (FastllmCudaGetNcclForceSync()) {
+            // Warmup still force-syncs NCCL. Size the persistent scratch to
+            // the serving token budget so decode never has to grow it.
+            const int maxTokens = std::max(
+                tokens, std::max(16, fastllm::GetMaxTokens()));
+            allocBytes = (size_t)maxTokens * packedN * sizeof(half);
+        }
+        if (runtime.nvfp4ScratchBytes < scratchBytes) {
+            void *grown = nullptr;
+            if (FastllmCudaTryMalloc(&grown, allocBytes) !=
+                FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                printf("Fastllm NVFP4 SM70 GEMM scratch alloc failed "
+                       "(tokens=%d, packedN=%d, bytes=%zu, forceSync=%d).\n",
+                       tokens, packedN, allocBytes,
+                       (int)FastllmCudaGetNcclForceSync());
+                return false;
+            }
+            if (runtime.nvfp4Scratch != nullptr &&
+                !FastllmCudaFreeAfterStream(runtime.nvfp4Scratch, stream)) {
+                FastllmCudaFree(runtime.nvfp4Scratch);
+            }
+            runtime.nvfp4Scratch = grown;
+            runtime.nvfp4ScratchBytes = allocBytes;
+        }
+        gemmOutput = static_cast<half *>(runtime.nvfp4Scratch);
+    }
     op.dispatch = SelectDispatch(
         runtime, DenseWeightKind::kNvfp4, tokens, packedN, K,
         kNvfp4GroupSize);
@@ -1031,7 +1051,6 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
         gemmOutput, descD, gemmOutput, descD,
         runtime.workspace.workspace, stream);
     if (ec != 0) {
-        releaseTemporary();
         printf("Fastllm NVFP4 SM70 GEMM failed "
                "(ec=%d, M=%d, N=%d, packedN=%d, K=%d).\n",
                ec, tokens, N, packedN, K);
@@ -1045,11 +1064,9 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
         CropNvfp4OutputKernel<<<grid, threads, 0, stream>>>(
             gemmOutput, out, tokens, N, packedN);
         if (cudaPeekAtLastError() != cudaSuccess) {
-            releaseTemporary();
             return false;
         }
     }
-    releaseTemporary();
     return true;
 }
 

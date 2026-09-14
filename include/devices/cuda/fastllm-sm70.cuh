@@ -17,6 +17,7 @@
 //   FASTLLM_SM70            master switch
 //   FASTLLM_SM70_QPN        QPN family
 //   FASTLLM_SM70_FP8_QPN8   FP8 QPN8 dense GEMM
+//   FASTLLM_SM70_NVFP4_QPN2 NVFP4 QPN2 dense GEMM
 //
 #pragma once
 
@@ -65,6 +66,49 @@ bool Fp8QpnPrepare(const uint8_t *qweight, const float *scales,
 bool Fp8QpnGemm(const uint8_t *codes, const half *groupScales,
                 const half *in, half *out,
                 int m, int k, int n, bool channelScales, cudaStream_t stream);
+
+// NVFP4 QPN2 dense GEMM. True only on SM70 when FASTLLM_SM70 /
+// FASTLLM_SM70_QPN / FASTLLM_SM70_NVFP4_QPN2 are not explicitly disabled.
+bool Nvfp4QpnSupported();
+
+// Shape gate: 1 <= M <= 32, K % 64 == 0, N % 32 == 0, and K/16 is divisible
+// by a supported split-K in {8, 16, 32}.
+bool Nvfp4QpnCanRun(int m, int k, int n);
+
+// Weight preparation. weight is the source [N, K/2] row-major packed NVFP4
+// bytes (even K in the low nibble). scales is [N, K/16] row-major FP8_E4M3
+// group scales. codes and packedScales receive the QPN2 fragment layout;
+// the caller owns and must allocate codes (N*K/2 bytes) and packedScales
+// (N*K/16 bytes). All pointers are device pointers.
+bool Nvfp4QpnPrepare(const uint8_t *weight, const uint8_t *scales,
+                     uint8_t *codes, uint8_t *packedScales,
+                     int k, int n, cudaStream_t stream);
+
+// FastLLM native NVFP4_BLOCK_16 is interleaved [N, (K/16)*12]: eight packed
+// E2M1 bytes plus one fused FP32 group scale (checkpoint E4M3 * globalScale).
+// This converts that layout into the QPN2 fragment layout (codes then raw
+// E4M3) by unfusing `fp32 / globalScale`, matching 1Cat-vLLM's raw-E4M3 +
+// weight_global_scale contract. GEMM must be called with the same globalScale.
+// Failure leaves the source untouched. Persistent size is N*K*9/16, which
+// fits in the native N*K*12/16 allocation. `dest == nullptr` overwrites
+// `storage` in place; otherwise packed codes/scales are written to `dest`
+// and the native source is preserved for the large-M path.
+bool Nvfp4QpnPrepareFromNative(uint8_t *storage, size_t storageBytes,
+                               int k, int n, float globalScale,
+                               cudaStream_t stream, uint8_t *dest = nullptr,
+                               size_t destBytes = 0);
+
+// QPN2 persistent bytes: packed codes (N*K/2) followed by E4M3 scales (N*K/16).
+inline size_t Nvfp4QpnPackedBytes(int k, int n) {
+  return static_cast<size_t>(n) * k / 2 + static_cast<size_t>(n) * k / 16;
+}
+
+// Dense GEMM: out[m, n] = in[m, k] @ dequant(W) * globalScale.
+// codes/packedScales are the buffers produced by Nvfp4QpnPrepare.
+// Returns false (without writing out) when the shape is not supported.
+bool Nvfp4QpnGemm(const uint8_t *codes, const uint8_t *packedScales,
+                  const half *in, half *out,
+                  int m, int k, int n, float globalScale, cudaStream_t stream);
 
 }  // namespace sm70
 }  // namespace fastllm

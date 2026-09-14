@@ -6,6 +6,7 @@
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
+#include "devices/cuda/fastllm-sm70.cuh"
 
 #include <cmath>
 #include <cstring>
@@ -3544,12 +3545,36 @@ static inline size_t FastllmCudaNVFP4Block16BytesPerRow(int m) {
     return (size_t)((m - 1) / 16 + 1) * (8 + sizeof(float));
 }
 
+// Checkpoint tensor-level NVFP4 multiplier. CreateFromOriData stores the
+// safetensors weight_scale_2 / weight_global_scale (after CT reciprocation)
+// in Data::scales. Empty means 1.0. Merged partitions follow 1Cat and use
+// max(), then prepare unfuses FP32/G and GEMM multiplies the same G.
+static float FastllmCudaNVFP4Qpn2GlobalScale(const fastllm::Data &weight) {
+    if (weight.scales.empty()) {
+        return 1.0f;
+    }
+    float scale = weight.scales[0];
+    for (size_t i = 1; i < weight.scales.size(); ++i) {
+        scale = std::max(scale, weight.scales[i]);
+    }
+    return scale;
+}
+
+// QPN2 lives in nvfp4Qpn2Packed. cudaData stays native/TurboMind so prefill
+// (M > 32) can keep the 1Cat large-M path. Do not in-place overwrite cudaData.
+static bool FastllmCudaHasNVFP4Qpn2Layout(const fastllm::Data &weight) {
+    return weight.nvfp4Qpn2Packed != nullptr &&
+           weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+           weight.blockM == 16 && weight.blockK == 1;
+}
+
 static bool FastllmCudaHasNVFP4Sm70TurboMindLayout(
         const fastllm::Data &weight) {
     return weight.cudaData != nullptr &&
            weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
            weight.blockM == 16 && weight.blockK == 1 &&
-           weight.IsRepacked && fastllm::awq_sm70::Nvfp4Supported();
+           weight.IsRepacked &&
+           fastllm::awq_sm70::Nvfp4Supported();
 }
 
 static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
@@ -3573,6 +3598,79 @@ static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
         return false;
     }
     weight.IsRepacked = true;
+    return true;
+}
+
+static bool FastllmCudaEnsureNVFP4Qpn2Layout(
+        fastllm::Data &weight, int inputDim, int outputDim) {
+    if (FastllmCudaHasNVFP4Qpn2Layout(weight)) {
+        return true;
+    }
+    static std::mutex prepareMutex;
+    std::lock_guard<std::mutex> lock(prepareMutex);
+    if (FastllmCudaHasNVFP4Qpn2Layout(weight)) {
+        return true;
+    }
+    if (weight.cudaData == nullptr || weight.IsRepacked ||
+        weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.blockM != 16 || weight.blockK != 1 ||
+        !fastllm::sm70::Nvfp4QpnSupported() ||
+        !fastllm::sm70::Nvfp4QpnCanRun(1, inputDim, outputDim)) {
+        return false;
+    }
+    const size_t packedBytes =
+        fastllm::sm70::Nvfp4QpnPackedBytes(inputDim, outputDim);
+    void *packed = FastllmCudaMalloc(packedBytes);
+    if (packed == nullptr) {
+        return false;
+    }
+    if (!fastllm::sm70::Nvfp4QpnPrepareFromNative(
+            static_cast<uint8_t *>(weight.cudaData), weight.GetBytes(),
+            inputDim, outputDim, FastllmCudaNVFP4Qpn2GlobalScale(weight),
+            cudaStreamPerThread, static_cast<uint8_t *>(packed), packedBytes)) {
+        FastllmCudaFree(packed);
+        return false;
+    }
+    weight.nvfp4Qpn2Packed = packed;
+    return true;
+}
+
+static bool FastllmCudaTryNVFP4Qpn2(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    // 1Cat: QPN2 is decode-only (M <= 32). Large-M prefill keeps native /
+    // TurboMind. Do not tile 80k rows through this kernel.
+    if (n < 1 || n > 32 ||
+        !fastllm::sm70::Nvfp4QpnCanRun(n, m, k)) {
+        return false;
+    }
+    if (!FastllmCudaHasNVFP4Qpn2Layout(weight)) {
+        if (!FastllmCudaGetNcclForceSync() ||
+            !FastllmCudaEnsureNVFP4Qpn2Layout(weight, m, k)) {
+            return false;
+        }
+    }
+
+    half *cudaInput = static_cast<half *>(FastllmCudaPrepareInput(input));
+    half *cudaOutput = static_cast<half *>(FastllmCudaPrepareOutput(output));
+    const auto *codes = static_cast<const uint8_t *>(weight.nvfp4Qpn2Packed);
+    const auto *packedScales = codes + static_cast<size_t>(k) * m / 2;
+    const float globalScale = FastllmCudaNVFP4Qpn2GlobalScale(weight);
+    bool ok = fastllm::sm70::Nvfp4QpnGemm(
+        codes, packedScales, cudaInput, cudaOutput, n, m, k,
+        globalScale, cudaStreamPerThread);
+    if (!ok) {
+        printf("Error: SM70 NVFP4 QPN2 GEMM failed after sidecar pack.\n");
+        throw("nvfp4 sm70 qpn2 gemm error");
+    }
+    if (bias.dims.size() > 0 && !weight.extraCudaHalfData.empty() &&
+        weight.extraCudaHalfData[0] != nullptr) {
+        FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+            cudaOutput, static_cast<half *>(weight.extraCudaHalfData[0]), k);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
 
@@ -3615,6 +3713,43 @@ static inline size_t FastllmCudaNVFP4Block16E8M0BytesPerRow(
 
 bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureBiasOnDevice(weight, bias, k);
+
+    if (n >= 1 && n <= 32 && FastllmCudaHasNVFP4Qpn2Layout(weight) &&
+        fastllm::sm70::Nvfp4QpnCanRun(n, m, k)) {
+        float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+        float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+        const int inputLen = n * m;
+        const int outputLen = n * k;
+        half *cudaFp16Input = (half *)FastllmCudaMalloc(
+            (size_t)inputLen * sizeof(half));
+        half *cudaFp16Output = (half *)FastllmCudaMalloc(
+            (size_t)outputLen * sizeof(half));
+        FastllmCudaFloat2HalfKernel<<<(inputLen + 255) / 256, 256, 0,
+                                      cudaStreamPerThread>>>(
+            cudaInput, cudaFp16Input, inputLen);
+        const auto *codes = static_cast<const uint8_t *>(weight.nvfp4Qpn2Packed);
+        const auto *packedScales = codes + static_cast<size_t>(k) * m / 2;
+        const float globalScale = FastllmCudaNVFP4Qpn2GlobalScale(weight);
+        const bool ok = fastllm::sm70::Nvfp4QpnGemm(
+            codes, packedScales, cudaFp16Input, cudaFp16Output, n, m, k,
+            globalScale, cudaStreamPerThread);
+        if (!ok) {
+            printf("Error: SM70 NVFP4 QPN2 FP32 adapter GEMM failed.\n");
+            throw("nvfp4 sm70 qpn2 fp32 adapter gemm error");
+        }
+        FastllmCudaHalf2FloatKernel<<<(outputLen + 255) / 256, 256, 0,
+                                      cudaStreamPerThread>>>(
+            cudaFp16Output, cudaOutput, outputLen);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+                cudaOutput, (float*)weight.extraCudaData[0], k);
+        }
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
 
     float *cudaBiasData = (float*)weight.extraCudaData[0];
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
@@ -3772,6 +3907,11 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
 
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
+
+    if (FastllmCudaTryNVFP4Qpn2(
+            input, weight, bias, output, n, m, k)) {
+        return true;
+    }
 
     if (FastllmCudaTryNVFP4Sm70TurboMind(
             input, weight, bias, output, n, m, k)) {
