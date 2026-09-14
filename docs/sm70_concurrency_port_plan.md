@@ -846,7 +846,74 @@ C=1 80K 已钉死稳态：**Prefill 1188.83 tok/s，Decode after TTFT 59.98 tok/
 
 C=1 180K（`input_tokens=184320`）同样跑通：Prefill **978.40 tok/s**，Decode after TTFT **50.13 tok/s**，TPOP 19.95 ms/tok。相对 8K 慢约 29%，相对 80K 慢约 16%。KV 上限 230400（1800 pages），AddPrefill 1440 pages 刚好覆盖 180K，加载后单卡约 14.0 GB / 16 GB。无新 Xid。
 
-### 16.2 未完成（需要 32GB V100 + 完整模型才能验证，本轮刻意未盲改）
+### 16.2 SM70 CUDA Graph 默认开启（已落地）
+
+方案 §3.1 的 I 项与「验收清单」的第一条。这是 1Cat 14 ms 路线的前提条件：
+它自己的 trace 里每 rank 每 token 仍发射 1062–1141 个 kernel，图是摊掉 launch
+税的唯一手段。
+
+**改动点**：只动 host 侧策略，内核一行未改。
+
+- `tools/fastllm_pytools/util.py`
+  - 新增 `CUDA_GRAPH_AUTO_MIN_COMPUTE_CAPABILITY = 70`，把原来的
+    `> 75` 硬编码换成「≥ 70」。
+  - 保留 Volta 一代的显式回滚开关 `FASTLLM_QWEN35_SM70_CUDA_GRAPH=0`。
+    该开关只在**全部**选中设备都 <7.5 时生效；`70+89` 这类混合组不受影响
+    （否则一块 V100 会静默关掉整个 TP 组的图）。
+  - 设备能力未知（驱动查询失败）仍判为不支持，维持原来的保守语义。
+- `test/api/test_qwen35_auto_fast_paths.py`
+  - 原 `test_does_not_auto_enable_graph_on_sm75_or_older` 编码的是旧契约，
+    改写为 `test_does_not_auto_enable_graph_before_volta`（60/62/5 拒绝），
+    并新增 Volta 开、Volta 回滚、混合能力不受回滚影响三组用例。
+
+**为什么 7.5 这个阈值可以降**：先验证再改，不靠推测。单卡 V100-SXM2 上跑
+最小探针（stream capture → 图内 cuBLAS GEMM → `EndCapture` → `Instantiate`
+→ replay ×3 → 重新捕获），全部通过：
+
+```
+device=Tesla V100-SXM2-16GB cc=7.0
+warmup ok / BeginCapture ok / EndCapture ok
+graph nodes=5 / Instantiate ok / replay x3 ok / recapture+replay ok
+RESULT: SM70_graph_capture=OK
+```
+
+也就是说 7.5 是**策略**门槛，不是能力门槛。这一点在结论写进代码注释前先被
+实测钉死，避免把「疑似不行」当成「确实不行」。
+
+**端到端证据**（本机 4×V100-SXM2-**16GB**，TP4，Qwen3.8-27B-QUASAR-NVFP4，
+greedy，input 2048 / output 128，`--prefix_cache false`）：
+
+| 指标 | graph off（对照） | graph on | 变化 |
+| --- | ---: | ---: | ---: |
+| TPOP avg | 17.07 ms/token | **13.91 ms/token** | −18.5% |
+| Batch decode after TTFT | 58.57 tok/s | **71.89 tok/s** | **+22.7%** |
+| 4 rank 图捕获 | — | 全部成功，stable pointers 25–27 | — |
+
+**数值等价**：两次运行 greedy token 流 **SHA256 完全相同**
+（`6892bf03d270d9a955dce9d29e4838dda24b7764612dfecb9e78670bd04040e2`）。
+图内路径与 eager 路径逐 token 一致，没有牺牲正确性换吞吐。
+
+为了能出这个证据，`tools/fastllm_pytools/benchmark.py` 增加了
+`_token_stream_hash`，在 `Reproducibility / Token stream sha256` 一栏打印
+本次运行生成 token 序列的摘要。以后任何「图 on/off 是否等价」「改动是否动了
+数值」的对照，都可以直接比这一栏，不必再手工 dump token。
+
+**80K 长上下文复核**（同一二进制，`FASTLLM_PAGED_CUBLAS_CHUNK=2048`，
+`--tokens 167936 --warmup 0`，greedy，input 81920 / output 256）：
+
+| 合同 | graph off | graph on | 变化 |
+| --- | ---: | ---: | ---: |
+| C=1 80K Prefill | 1970.36 tok/s | 1971.87 tok/s | 0（图只管 decode） |
+| **C=1 80K Decode after TTFT** | 51.17 tok/s | **64.31 tok/s** | **+25.7%** |
+| C=1 TPOP | 19.54 ms | **15.55 ms** | −20.4% |
+| C=1 token sha256 | `9bb0aa71…` | `9bb0aa71…` | 相同 |
+| C=2 80K token sha256 | `ea2857f4…` | `ea2857f4…` | 相同 |
+
+C=1 80K 是干净的稳定态测量，图在这里的收益（+25.7%）比 8K（+22.7%）还大，
+符合「上下文越长、每 step GPU 服务越长、launch 税占比越稳定」的预期。
+相对 8K 的 72.02 tok/s，80K 只慢约 11%。
+
+### 16.3 未完成（需要 32GB V100 + 完整模型才能验证，本轮刻意未盲改）
 
 **PR0 主体：batched `ForwardBatch`**
 
@@ -911,9 +978,9 @@ native unpack 回归（`sm70QpnNvfp4Regression`）：
 [native_k1536] m=4  k=1536 n=256  relL2=2.081e-04 OK
 ```
 
-### 16.3 下一步建议
+### 16.4 下一步建议
 
 1. C=4 长 prompt 已测完到 8K：2048/4096 聚合约 123 tok/s，8K 因串行 prefill 掉到 47 tok/s，仍低于 1Cat 164 tok/s。下一步看 chunked prefill / 入队是否能并行。
-2. QPN8 FP8 按 16.2 接入 Linear（当前模型是 NVFP4，QPN8 需 FP8 权重才能端到端验证）。
+2. QPN8 FP8 按 16.3 接入 Linear（当前模型是 NVFP4，QPN8 需 FP8 权重才能端到端验证）。
 3. 在 4×V100-**32GB** 上跑通 Qwen4-Exp `--max_batch 4`（PR0 主体）。
 4. 之后按方案第 12 节顺序推进 QPN4 / MoE direct / push AR。

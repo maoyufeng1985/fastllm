@@ -171,8 +171,8 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
             self.assertEqual(
                 os.environ["FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"], "64")
 
-    def test_does_not_auto_enable_graph_on_sm75_or_older(self):
-        for capability in (70, 75):
+    def test_does_not_auto_enable_graph_before_volta(self):
+        for capability in (60, 62, 5):
             with self.subTest(compute_capability=capability), patch.dict(
                     os.environ, {}, clear=True), patch(
                     "fastllm_pytools.util._is_nvidia_cuda_platform",
@@ -188,6 +188,74 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
                 self.assertEqual(os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "1")
                 self.assertTrue(args.cuda_embedding)
 
+    def test_auto_enables_graph_on_volta(self):
+        for capability in (70, 72):
+            with self.subTest(compute_capability=capability), patch.dict(
+                    os.environ, {}, clear=True), patch(
+                    "fastllm_pytools.util._is_nvidia_cuda_platform",
+                    return_value=True), patch(
+                    "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                    return_value={0: capability, 1: capability}):
+                _configure_qwen35_auto_fast_paths(
+                    _args(), is_qwen35_model=True, mtp=0)
+
+                self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
+                self.assertEqual(
+                    os.environ["FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"], "64")
+
+    def test_volta_can_be_opted_out_without_affecting_newer_devices(self):
+        with self.subTest(case="volta opted out"), patch.dict(
+                os.environ, {"FASTLLM_QWEN35_SM70_CUDA_GRAPH": "0"},
+                clear=True), patch(
+                "fastllm_pytools.util._is_nvidia_cuda_platform",
+                return_value=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 70, 1: 70}):
+            _configure_qwen35_auto_fast_paths(
+                _args(), is_qwen35_model=True, mtp=0)
+
+            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+            self.assertEqual(os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "1")
+
+        with self.subTest(case="volta opted back in"), patch.dict(
+                os.environ, {"FASTLLM_QWEN35_SM70_CUDA_GRAPH": "1"},
+                clear=True), patch(
+                "fastllm_pytools.util._is_nvidia_cuda_platform",
+                return_value=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 70, 1: 70}):
+            _configure_qwen35_auto_fast_paths(
+                _args(), is_qwen35_model=True, mtp=0)
+
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
+
+        with self.subTest(case="newer device ignores the volta switch"), \
+                patch.dict(
+                os.environ, {"FASTLLM_QWEN35_SM70_CUDA_GRAPH": "0"},
+                clear=True), patch(
+                "fastllm_pytools.util._is_nvidia_cuda_platform",
+                return_value=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 89, 1: 89}):
+            _configure_qwen35_auto_fast_paths(
+                _args(), is_qwen35_model=True, mtp=0)
+
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
+
+    def test_volta_opt_out_ignored_for_mixed_capability_tp(self):
+        # A 70+89 pairing is not a Volta-only system, so the Volta opt-out
+        # must not silently disable the graph for the whole group.
+        with patch.dict(os.environ, {"FASTLLM_QWEN35_SM70_CUDA_GRAPH": "0"},
+                        clear=True), patch(
+                "fastllm_pytools.util._is_nvidia_cuda_platform",
+                return_value=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 70, 1: 89}):
+            _configure_qwen35_auto_fast_paths(
+                _args(), is_qwen35_model=True, mtp=0)
+
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
+
     def test_single_cuda_device_uses_its_compute_capability(self):
         with patch.dict(os.environ, {}, clear=True), patch(
                 "fastllm_pytools.util._is_nvidia_cuda_platform",
@@ -201,10 +269,10 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
             )
 
             capability_query.assert_called_once_with([3])
-            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
 
-    def test_does_not_auto_enable_graph_for_mixed_sm75_tp(self):
-        capabilities = {0: 89, 1: 75}
+    def test_does_not_auto_enable_graph_for_mixed_pre_volta_tp(self):
+        capabilities = {0: 89, 1: 60}
         with patch.dict(os.environ, {}, clear=True), patch(
                 "fastllm_pytools.util._is_nvidia_cuda_platform",
                 return_value=True), patch(
@@ -221,6 +289,19 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
                 return_value=True), patch(
                 "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
                 return_value={}):
+            _configure_qwen35_auto_fast_paths(
+                _args(), is_qwen35_model=True, mtp=0)
+
+            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+
+    def test_does_not_auto_enable_graph_when_one_capability_is_unknown(self):
+        # The driver query can fail for a single device while succeeding for
+        # its peers. A partially known TP group must not enable the graph.
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._is_nvidia_cuda_platform",
+                return_value=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 89}):
             _configure_qwen35_auto_fast_paths(
                 _args(), is_qwen35_model=True, mtp=0)
 

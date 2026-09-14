@@ -1,10 +1,25 @@
 import argparse
 import ctypes
+import hashlib
 import statistics
 import time
 from typing import Dict, List, Optional
 
 from .util import make_normal_llm_model, make_normal_parser
+
+
+def _token_stream_hash(requests: List[Dict[str, object]]) -> str:
+    """Hash the per-request generated token ids.
+
+    Two runs that differ only in an execution detail (CUDA graph on/off, for
+    example) must produce the same greedy stream; comparing this digest is how
+    a caller proves that without dumping every token.
+    """
+    digest = hashlib.sha256()
+    for item in requests:
+        digest.update(",".join(str(t) for t in item.get("token_ids", [])).encode())
+        digest.update(b"|")
+    return digest.hexdigest()
 
 
 def add_benchmark_args(parser: argparse.ArgumentParser):
@@ -135,6 +150,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             "end_time": None,
             "output_tokens": 0,
             "finish_code": None,
+            "token_ids": [],
         })
 
     pending = set(range(batch))
@@ -155,6 +171,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             if item["first_token_time"] is None:
                 item["first_token_time"] = now
             item["output_tokens"] += 1
+            item["token_ids"].append(int(token))
         if not progressed:
             time.sleep(0.0005)
 
@@ -207,6 +224,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         "batch_decode_tokens_per_second": (
             decode_tokens / max(batch_decode_span, 1e-9) if batch_decode_span > 0 else 0.0
         ),
+        "token_hash": _token_stream_hash(requests),
     }
 
 
@@ -291,6 +309,10 @@ def _print_result(result: Dict[str, object]):
               _format_tokens_per_second(result["batch_decode_tokens_per_second"]))
     _print_kv("Per request avg",
               _format_tokens_per_second(result["per_request_tokens_per_second_avg"]))
+
+    print()
+    print("Reproducibility")
+    _print_kv("Token stream sha256", result["token_hash"])
 
     early_finished = [
         item for item in result["requests"]

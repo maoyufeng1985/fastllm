@@ -10471,6 +10471,14 @@ namespace fastllm {
             ForwardGPU(eagerWarmupBatch, inputIds, attentionMasks, positionIds,
                        seqLens, pastKeyValues, generationConfigs, lastTokens,
                        nullptr);
+            int previousSyncDevice = FastllmCudaGetDevice();
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+            if (previousSyncDevice >= 0) {
+                FastllmCudaSetDevice(previousSyncDevice);
+            }
             printf("[Fastllm] Qwen3.5 serving eager prefill warmup (%s): "
                    "batch %d, total tokens %d.\n",
                    reason, eagerWarmupBatch, eagerWarmupTokens);
@@ -11470,28 +11478,16 @@ namespace fastllm {
                                           zWeightName + ".tp_bias"),
                             buf.gdnZProjection);
                     }
-                    // Preserve the batch-1 zero-copy path without replacing the
-                    // owning max-batch workspace tensors with borrowed views.
-                    // The temporary view objects are non-owning; captured nodes
-                    // retain only their stable offsets into gdnMerged.
-                    bool useSingleRowGdnViews =
-                        !hasSeparateQkvZGdnInLinear && batch == 1 &&
-                        CanUseSingleRowLastDimView(buf.gdnMerged);
-                    Data singleRowQkvConvInput, singleRowZ, singleRowBa;
+                    // Graph nodes retain every device pointer used during
+                    // capture.  Never borrow stack views or request-owned GDN
+                    // caches here: dummy warmup tensors die before serving
+                    // replay, and SM70 then faults on the stale addresses.
                     Data *graphQkvConvInput = &buf.qkvConvInput;
                     Data *graphZ = &buf.z;
                     Data *graphBa = &buf.ba;
                     if (hasSeparateQkvZGdnInLinear) {
                         graphQkvConvInput = &buf.gdnQkvProjection;
                         graphZ = &buf.gdnZProjection;
-                    } else if (useSingleRowGdnViews) {
-                        MakeSingleRowLastDimView(
-                            buf.gdnMerged, 0, localQkvDim, singleRowQkvConvInput);
-                        MakeSingleRowLastDimView(
-                            buf.gdnMerged, localQkvDim,
-                            localQkvDim + localVd, singleRowZ);
-                        graphQkvConvInput = &singleRowQkvConvInput;
-                        graphZ = &singleRowZ;
                     } else {
                         Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0,
                                        localQkvDim, buf.qkvConvInput);
@@ -11499,13 +11495,7 @@ namespace fastllm {
                                        localQkvDim, localQkvDim + localVd,
                                        buf.z);
                     }
-                    if (hasMergedGdnInLinear && useSingleRowGdnViews) {
-                        MakeSingleRowLastDimView(
-                            buf.gdnMerged, localQkvDim + localVd,
-                            localQkvDim + localVd + localValueHeads * 2,
-                            singleRowBa);
-                        graphBa = &singleRowBa;
-                    } else if (hasMergedGdnInLinear) {
+                    if (hasMergedGdnInLinear) {
                         Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1,
                                        localQkvDim + localVd,
                                        localQkvDim + localVd +
@@ -11523,12 +11513,9 @@ namespace fastllm {
                     Data &activeBa = *graphBa;
 
                     Data &pastKey = *pastKeyValues[i].first;
-                    if (batch == 1) {
-                        SwapSingleTokenSeqHeadByReshape(activeQkvConvInput);
-                    } else {
-                        activeQkvConvInput.Reshape(
-                            {batch, activeQkvConvInput.dims.back(), 1});
-                    }
+                    int qkvChannels = std::max(
+                        1, (int)(activeQkvConvInput.Count(0) / (uint64_t)std::max(1, batch)));
+                    activeQkvConvInput.Reshape({batch, qkvChannels, 1});
                     activeZ.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
                     for (int bidx = 0; bidx < batch; bidx++) {
@@ -11549,6 +11536,17 @@ namespace fastllm {
                     }
                     if (directBatchDecodeConvSilu) {
                         buf.convOutput.Reshape({1, batch, buf.convOutput.dims[1]});
+                    } else if (FastllmCudaGraphIsCapturing()) {
+                        printf("Warning: Qwen3.5 CUDA graph capture cannot use "
+                               "request-owned GDN conv cache on gpu %d layer %d "
+                               "(pool=%p slotIds=%p).\n",
+                               gpuId, i,
+                               linearConvPool == nullptr ? nullptr :
+                                   linearConvPool->cudaData,
+                               workspace.linearSlotIds.cudaData);
+                        fflush(stdout);
+                        FastllmCudaSetThreadError();
+                        return;
                     } else if (batch == 1) {
                         bool fusedDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
                             pastKey, activeQkvConvInput,
@@ -11618,6 +11616,13 @@ namespace fastllm {
                         }
                         buf.coreAttnOut.Reshape({1, batch, buf.coreAttnOut.dims[1],
                                                  buf.coreAttnOut.dims[3]});
+                    } else if (FastllmCudaGraphIsCapturing()) {
+                        printf("Warning: Qwen3.5 CUDA graph capture cannot use "
+                               "request-owned GDN recurrent state on gpu %d layer %d.\n",
+                               gpuId, i);
+                        fflush(stdout);
+                        FastllmCudaSetThreadError();
+                        return;
                     }
 
                     if (!fusedBatchRecurrentFromConvBa) {
@@ -12333,6 +12338,13 @@ namespace fastllm {
         state.reservedPointers.swap(capturedReservedPointers);
         state.captured = true;
         bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
+        if (firstLaunchOk) {
+            // cudaGraphLaunch itself does not surface kernel faults.  Sync the
+            // capture-time dummy request now so a later serving replay cannot
+            // inherit a poisoned device from this first launch.
+            ForceDeviceSync();
+            firstLaunchOk = !FastllmCudaGetThreadError();
+        }
         if (tpGraphContext != nullptr) {
             firstLaunchOk = tpGraphContext->All(
                 tpGraphRank, firstLaunchOk);

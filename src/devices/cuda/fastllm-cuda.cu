@@ -265,8 +265,9 @@ void FastllmCudaSetNcclActive(bool value) {
 
 // 是否要求 NCCL 集合通信「发射后立即同步」。默认 true（安全）：权重加载与 warmup 阶段几乎每次都会
 // 发生真实 cudaMalloc，与在途集合通信争用 CUDA 驱动锁会导致跨 rank 死锁，故全程同步发射。
-// warmup 成功结束后由 basellm 置为 false：此时内存池已热、稳态前向基本不再有真实 cudaMalloc，
-// 异步发射安全且能恢复通信/计算重叠带来的吞吐。malloc 护栏继续作为稳态兜底。
+// warmup 成功结束后由 basellm 置为 false：此时内存池已热。稳态前向仍可能有偶发
+// 池未命中；TryMalloc 在异步 NCCL 期间禁止真实 cudaMalloc，避免与在途集合通信
+// 争用驱动锁。异步发射因此可以恢复通信/计算重叠。
 std::atomic<bool> fastllmCudaNcclForceSync(true);
 void FastllmCudaSetNcclForceSync(bool value) {
     fastllmCudaNcclForceSync.store(value, std::memory_order_relaxed);
@@ -380,29 +381,24 @@ printf("\n");
 }
 */
 
-static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
 // CUDA Graph capture cannot rely on cuBLAS lazily allocating its default
-// workspace. Keep one process-lifetime workspace next to each process-lifetime
-// handle when graphs are enabled. The size is configurable for memory-tight
-// deployments, while 32 MiB covers the default workspace used by recent
-// architectures (including Blackwell).
-static std::map<int, void*> s_fastllmCublasWorkspaceMap;
-static std::mutex s_fastllmCublasHandleMapMutex;
+// workspace. Keep one process-lifetime workspace per calling thread/device
+// when graphs are enabled. Sharing one workspace across handles is unsafe:
+// a later eager GEMM on another worker can race with a captured graph that
+// still owns that workspace. 32 MiB covers the default workspace used by
+// recent architectures (including Blackwell).
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
     cudaGetDevice(&id);
-    // 线程级张量并行时，多个 worker 线程会并发访问该全局 map，
-    // 必须加锁，否则并发读写 std::map 会破坏其内部结构导致死循环/崩溃。
-    std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
-    auto it = s_fastllmCublasHandleMap.find(id);
-    if (it != s_fastllmCublasHandleMap.end()) {
-        // Every FastLLM CUDA operator uses the per-thread default stream, and
-        // the symbolic cudaStreamPerThread handle remains valid when the
-        // cublas handle is subsequently used by a persistent worker thread.
-        // Rebinding on every GEMM is redundant; more importantly,
-        // cublasSetStream resets cuBLAS workspace state and is not safe inside
-        // an already active CUDA Graph capture. Keep the handle's stream
-        // stable after creation so warmed GEMMs can be captured and replayed.
+    // cudaStreamPerThread is a per-thread stream.  Binding a process-wide
+    // handle to it during graph capture leaves later eager GEMMs on a
+    // different worker targeting the capture thread's stream, which on SM70
+    // faults after the captured graph is instantiated.  Keep one handle and
+    // one cuBLAS workspace per calling thread/device.
+    thread_local std::map<int, cublasHandle_t> threadHandles;
+    thread_local std::map<int, void*> threadWorkspaces;
+    auto it = threadHandles.find(id);
+    if (it != threadHandles.end()) {
         return it->second;
     }
     cublasHandle_t handler = nullptr;
@@ -431,7 +427,7 @@ cublasHandle_t getFastllmCublasHandle() {
                     stat = cublasSetWorkspace(
                         handler, workspace, graphWorkspaceBytes);
                     if (stat == CUBLAS_STATUS_SUCCESS) {
-                        s_fastllmCublasWorkspaceMap[id] = workspace;
+                        threadWorkspaces[id] = workspace;
                     } else {
                         FastllmCudaDirectFree(workspace);
                         std::fprintf(
@@ -445,7 +441,7 @@ cublasHandle_t getFastllmCublasHandle() {
                 }
             }
         }
-        s_fastllmCublasHandleMap[id] = handler;
+        threadHandles[id] = handler;
     }
 
     return handler;
@@ -4746,7 +4742,9 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     if (FastllmCudaGraphIsCapturing() ||
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed) ||
+        (fastllmCudaNcclActive.load(std::memory_order_relaxed) &&
+         !fastllmCudaNcclForceSync.load(std::memory_order_relaxed))) {
         return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
     }
     int id = -1;
@@ -5138,7 +5136,15 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaGraphCurrentCaptureIdentity();
     const bool capturePoolOnly = captureIdentity.valid ||
         FastllmCudaGraphIsCapturingFast();
+    // After warmup, NCCL runs asynchronously. A pool miss that falls through
+    // to real cudaMalloc takes the process-wide driver lock while peer ranks
+    // may already be inside an AllReduce, which deadlocks tensor-parallel
+    // serving. Optional allocations must stay inside the hot pool then.
+    const bool servingNcclAsync =
+        fastllmCudaNcclActive.load(std::memory_order_relaxed) &&
+        !fastllmCudaNcclForceSync.load(std::memory_order_relaxed);
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
+        servingNcclAsync ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
@@ -5191,8 +5197,8 @@ static void *FastllmCudaMallocImpl(
 
         void * ret = nullptr;
         if (tryResult != nullptr &&
-            (capturePoolOnly || fastllmCudaMallocDisabled.load(
-                                    std::memory_order_relaxed))) {
+            (capturePoolOnly || servingNcclAsync ||
+             fastllmCudaMallocDisabled.load(std::memory_order_relaxed))) {
             *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
             return nullptr;
         }
@@ -5283,8 +5289,8 @@ static void *FastllmCudaMallocImpl(
     }
     void * ret = nullptr;
     if (tryResult != nullptr &&
-        (capturePoolOnly || fastllmCudaMallocDisabled.load(
-                                std::memory_order_relaxed))) {
+        (capturePoolOnly || servingNcclAsync ||
+         fastllmCudaMallocDisabled.load(std::memory_order_relaxed))) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
         return nullptr;
     }
@@ -5434,6 +5440,26 @@ void FastllmCudaForceFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
+    cudaPointerAttributes attributes;
+    cudaError_t attributeState = cudaPointerGetAttributes(&attributes, ret);
+    bool devicePointer = false;
+    if (attributeState == cudaSuccess) {
+#if (CUDART_VERSION < 10000) && !(defined(USE_ROCM))
+        devicePointer = attributes.memoryType == cudaMemoryTypeDevice;
+#else
+        devicePointer = attributes.type == cudaMemoryTypeDevice ||
+                        attributes.type == cudaMemoryTypeManaged;
+#endif
+        if (devicePointer && attributes.device != oriId) {
+            FastllmCudaSetDevice(attributes.device);
+        }
+    } else {
+        cudaGetLastError();
+    }
+    if (!devicePointer) {
+        FastllmCudaSetDevice(oriId);
+        return;
+    }
     state = cudaFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when force releasing uncached memory!", state);
@@ -5578,6 +5604,10 @@ void FastllmCudaFree(void *ret) {
             attributes.type == cudaMemoryTypeManaged) {
 #endif
             pointerDevice = attributes.device;
+        } else {
+            // Host / unregistered pointers must not reach cudaFree. CUDA
+            // attributes them to GPU0 and can raise Xid 13/43.
+            return;
         }
     } else {
         cudaGetLastError();
@@ -16185,8 +16215,6 @@ bool FastllmCudaSampleTopK(float *topk, float *temperatures,
 bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis) {
     int part = input.dims[axis];
     int outer = input.Count(0) / input.Count(axis);
-    int inputStride = input.Count(axis);
-    int outputStride = outputs[0]->Count(axis);
     int inner = input.strides[axis];
     int unitSize = input.unitSize;
 
@@ -16208,37 +16236,92 @@ bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int ax
 bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis) {
     int part = output.dims[axis];
     int outer = output.Count(0) / output.Count(axis);
-    int inputStride = inputs[0]->Count(axis);
-    int outputStride = output.Count(axis);
     int inner = output.strides[axis];
     int unitSize = output.unitSize;
 
-    // CatBatch is commonly placed between operators running on
-    // cudaStreamPerThread (FlashInfer, cuBLAS and NCCL).  Launching this copy
-    // on the legacy default stream can race both its producers and consumers.
-    // Keep a small per-thread/per-device pointer table alive so it also cannot
-    // be returned to FastLLM's caching allocator while the kernel is in flight.
-    thread_local static std::map<int, std::pair<uint8_t**, int> > pointerBuffers;
+    // CatBatch sits between cudaStreamPerThread producers/consumers (FlashInfer,
+    // cuBLAS, NCCL). A synchronous cudaMemcpy waits for that stream; after
+    // warmup it often still has an in-flight AllReduce, which deadlocks TP
+    // ranks. Stage the pointer table on a dedicated copy stream and
+    // double-buffer it so CPU never waits on the compute stream.
+    struct CatBatchPointerBuffer {
+        uint8_t **device[2] = {nullptr, nullptr};
+        uint8_t **host[2] = {nullptr, nullptr};
+        cudaStream_t copyStream = nullptr;
+        cudaEvent_t copyDone[2] = {nullptr, nullptr};
+        cudaEvent_t kernelDone[2] = {nullptr, nullptr};
+        bool kernelRecorded[2] = {false, false};
+        int capacity = 0;
+        int slot = 0;
+    };
+    thread_local static std::map<int, CatBatchPointerBuffer> pointerBuffers;
     int device = FastllmCudaGetDevice();
     auto &pointerBuffer = pointerBuffers[device];
-    if (pointerBuffer.second < part) {
-        if (pointerBuffer.first != nullptr) {
-            FastllmCudaSyncCurrentThreadStream();
-            FastllmCudaFree(pointerBuffer.first);
+    if (pointerBuffer.capacity < part) {
+        const int allocPart = std::max(part, 256);
+        if (pointerBuffer.copyStream == nullptr) {
+            cudaError_t streamState = cudaStreamCreateWithFlags(
+                &pointerBuffer.copyStream, cudaStreamNonBlocking);
+            checkCudaErrors(
+                "Error: CUDA error when creating CatBatch copy stream!",
+                streamState);
         }
-        pointerBuffer.first = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
-        pointerBuffer.second = part;
+        for (int slot = 0; slot < 2; slot++) {
+            pointerBuffer.device[slot] =
+                (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * allocPart);
+            pointerBuffer.host[slot] = nullptr;
+            cudaError_t hostState = cudaMallocHost(
+                (void **)&pointerBuffer.host[slot], sizeof(uint8_t*) * allocPart);
+            checkCudaErrors(
+                "Error: CUDA error when allocating CatBatch host pointer table!",
+                hostState);
+            if (pointerBuffer.copyDone[slot] == nullptr) {
+                cudaError_t eventState = cudaEventCreateWithFlags(
+                    &pointerBuffer.copyDone[slot], cudaEventDisableTiming);
+                checkCudaErrors(
+                    "Error: CUDA error when creating CatBatch copy event!",
+                    eventState);
+                eventState = cudaEventCreateWithFlags(
+                    &pointerBuffer.kernelDone[slot], cudaEventDisableTiming);
+                checkCudaErrors(
+                    "Error: CUDA error when creating CatBatch kernel event!",
+                    eventState);
+            }
+            pointerBuffer.kernelRecorded[slot] = false;
+        }
+        pointerBuffer.capacity = allocPart;
+        pointerBuffer.slot = 0;
     }
-    uint8_t **pointers = pointerBuffer.first;
-    uint8_t **cpuPointers = new uint8_t*[part];
+    pointerBuffer.slot ^= 1;
+    const int slot = pointerBuffer.slot;
+    if (pointerBuffer.kernelRecorded[slot]) {
+        cudaError_t waitState = cudaStreamWaitEvent(
+            pointerBuffer.copyStream, pointerBuffer.kernelDone[slot], 0);
+        checkCudaErrors(
+            "Error: CUDA error when waiting for previous CatBatch kernel!",
+            waitState);
+    }
+    uint8_t **pointers = pointerBuffer.device[slot];
+    uint8_t **cpuPointers = pointerBuffer.host[slot];
     for (int i = 0; i < part; i++) {
         cpuPointers[i] = (uint8_t*)inputs[i]->cudaData;
     }
-    cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
+    cudaError_t state = cudaMemcpyAsync(
+        pointers, cpuPointers, sizeof(uint8_t*) * part,
+        cudaMemcpyHostToDevice, pointerBuffer.copyStream);
+    checkCudaErrors("Error: CUDA error when copying CatBatch pointers!", state);
+    state = cudaEventRecord(pointerBuffer.copyDone[slot], pointerBuffer.copyStream);
+    checkCudaErrors("Error: CUDA error when recording CatBatch copy event!", state);
+    state = cudaStreamWaitEvent(
+        cudaStreamPerThread, pointerBuffer.copyDone[slot], 0);
+    checkCudaErrors(
+        "Error: CUDA error when waiting for CatBatch pointer copy!", state);
     FastllmCatBatchKernel <256> <<< part * outer, 256, 0, cudaStreamPerThread >>> (
         pointers, (uint8_t*)output.cudaData, outer, part, inner * unitSize);
-
-    delete[] cpuPointers;
+    state = cudaEventRecord(pointerBuffer.kernelDone[slot], cudaStreamPerThread);
+    checkCudaErrors(
+        "Error: CUDA error when recording CatBatch kernel event!", state);
+    pointerBuffer.kernelRecorded[slot] = true;
 
     DeviceSync();
     return true;
@@ -16250,7 +16333,7 @@ bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Da
     for (int i = 0; i < batch; i++) {
         cpuPointers[i] = (float*)inputs[i]->cudaData;
         cpuPointers[i + batch] = (float*)outputs[i]->cudaData;
-        cpuPointers[i + batch * 2] = (float*)(inputs[i]->Count(0));
+        cpuPointers[i + batch * 2] = (float*)(uintptr_t)(inputs[i]->Count(0));
     }
     cudaMemcpy(pointers, cpuPointers, sizeof(float*) * batch * 3, cudaMemcpyHostToDevice);
     FastllmMulBatchKernel <256> <<< batch, 256 >>> (pointers, batch, v);

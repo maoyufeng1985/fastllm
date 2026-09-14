@@ -935,6 +935,10 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
             }
 
             if (useGroupedGqa) {
+                {
+                    // 同上，确保 gather 写完后再让 cublas 读取。
+                    cudaStreamSynchronize(cudaStreamPerThread);
+                }
                 cublasStatus_t status = cublasHgemm(
                     handle, CUBLAS_OP_T, CUBLAS_OP_N,
                     chunkLen, groupedRows, headDim, &hscale,
@@ -988,12 +992,19 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 continue;
             }
 
+            {
+                // 保证 gather 内核写完 kChunk/vChunk 后再让 cublas 读取，避免非法地址。
+                // 该同步只覆盖当前 per-thread stream，开销远小于 cudaDeviceSynchronize。
+                cudaStreamSynchronize(cudaStreamPerThread);
+            }
+
             for (int g = 0; g < group; g++) {
                 int h = kvh * group + g;
                 float *lastSumH = lastSum + (size_t)g * qoLen;
                 float *lastMaxH = lastMax + (size_t)g * qoLen;
                 float *currentSumH = currentSum + (size_t)g * qoLen;
                 float *currentMaxH = currentMax + (size_t)g * qoLen;
+
                 half *qHead = nullptr;
                 int qLdb = qTokenStride;
                 if (qIsHalf) {

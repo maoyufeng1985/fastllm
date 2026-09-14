@@ -3961,9 +3961,15 @@ namespace fastllm {
                     std::uncaught_exceptions() != uncaughtExceptions;
 #ifdef USE_CUDA
                 auto finishCudaWarmup = []() {
-                    // warmup 结束后切回异步集合通信：此时内存池已热，稳态前向基本不再触发真实 cudaMalloc，
-                    // 异步发射安全且能恢复通信/计算重叠的吞吐。warmup 及之前(权重加载)保持同步以防死锁。
-                    FastllmCudaSetNcclForceSync(false);
+                    // warmup 结束后切回异步集合通信：此时内存池已热。稳态前向仍可能偶发
+                    // 池未命中，但 TryMalloc 在异步 NCCL 期间禁止真实 cudaMalloc。
+                    // warmup 及之前(权重加载)保持同步以防死锁。
+                    // SM70 长 prefill 会在 warmup 后首次增长 chunked-attention /
+                    // dequant scratch。真实 cudaMalloc 只同步当前 GPU，无法排空
+                    // 其它 rank 的在途 NCCL，会跨卡死锁。保持 ForceSync。
+                    if (FastllmCudaRuntimeArch() >= 75) {
+                        FastllmCudaSetNcclForceSync(false);
+                    }
                 };
 #else
                 auto finishCudaWarmup = []() {};

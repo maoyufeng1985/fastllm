@@ -308,16 +308,39 @@ def _thread_tp_cuda_device_ids(tp):
             result.append(int(device))
     return result
 
+# Minimum compute capability for automatic CUDA graph capture. 7.0 (Volta,
+# including V100) captures and replays correctly: stream capture, cuBLAS calls
+# inside a capture, instantiation, repeated replay and recapture were all
+# verified on V100-SXM2. The earlier 7.5 cutoff excluded V100 by policy rather
+# than by capability. Anything below Volta still opts out, as does a positively
+# identified Volta system when FASTLLM_QWEN35_SM70_CUDA_GRAPH=0 is set.
+CUDA_GRAPH_AUTO_MIN_COMPUTE_CAPABILITY = 70
+
+
 def _cuda_graph_auto_supported(cuda_spec) -> bool:
-    """Apply the SM75 cutoff only to positively identified NVIDIA systems."""
+    """Apply the compute-capability cutoff only to identified NVIDIA systems."""
     if not _is_nvidia_cuda_platform():
         return True
     device_ids = _thread_tp_cuda_device_ids(cuda_spec)
     if not device_ids:
         return False
     capabilities = _nvidia_cuda_compute_capabilities(device_ids)
-    return all(capabilities.get(device_id, 0) > 75
-               for device_id in device_ids)
+    # A missing entry means the driver query failed. Treat it as unsupported
+    # instead of silently assuming a capability.
+    if any(device_id not in capabilities for device_id in device_ids):
+        return False
+    if not all(capabilities[device_id] >= CUDA_GRAPH_AUTO_MIN_COMPUTE_CAPABILITY
+               for device_id in device_ids):
+        return False
+    # Volta predates the architectures the graph path was originally tuned for,
+    # so keep an explicit opt-out for that generation. Newer devices are
+    # unaffected by the switch.
+    if all(capabilities[device_id] < 75 for device_id in device_ids):
+        override = os.environ.get("FASTLLM_QWEN35_SM70_CUDA_GRAPH")
+        if override is not None and not _fastllm_env_flag_enabled(
+                "FASTLLM_QWEN35_SM70_CUDA_GRAPH"):
+            return False
+    return True
 
 def _configure_multicuda_worker_affinity(tp, threads):
     """Keep GPU launch workers off the NUMA MoE worker cores when possible."""
@@ -596,7 +619,11 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
         else:
             print(
                 "[Fastllm] Qwen3.5 auto CUDA graph disabled: every NVIDIA "
-                "CUDA device must have compute capability greater than 7.5.",
+                "CUDA device must have compute capability %d.%d or greater "
+                "and, on Volta, must not be opted out via "
+                "FASTLLM_QWEN35_SM70_CUDA_GRAPH=0." % (
+                    CUDA_GRAPH_AUTO_MIN_COMPUTE_CAPABILITY // 10,
+                    CUDA_GRAPH_AUTO_MIN_COMPUTE_CAPABILITY % 10),
                 flush=True,
             )
     if eligible and handoff_env not in os.environ:
