@@ -22,6 +22,52 @@ def _token_stream_hash(requests: List[Dict[str, object]]) -> str:
     return digest.hexdigest()
 
 
+def _common_decode_window(requests: List[Dict[str, object]],
+                          batch_end: float):
+    """Span in which every request has finished prefill and is decoding.
+
+    The start is the *last* first-token time, not the first one. Starting at
+    the earliest TTFT charges a peer's still-running prefill to decode, which
+    for serialized long-context prefills (C=2 at 80K) misreports the steady
+    rate by an order of magnitude.
+
+    Each request's first token is its prefill result, so it is never counted
+    as a decode token. Returns (start, span, tokens); start is None when no
+    request produced a token.
+    """
+    starts = [item["first_token_time"] for item in requests
+              if item["first_token_time"] is not None]
+    if not starts:
+        return None, 0.0, 0
+    start = max(starts)
+    span = max(0.0, batch_end - start)
+    tokens = sum(
+        1
+        for item in requests
+        for index, stamp in enumerate(item["token_times"])
+        if index > 0 and stamp > start
+    )
+    return start, span, tokens
+
+
+def _per_request_common_rate(item: Dict[str, object], start: Optional[float]) -> float:
+    """Decode rate for one request measured inside the common window."""
+    if start is None:
+        return 0.0
+    own_end = item["end_time"]
+    if own_end is None:
+        return 0.0
+    span = max(0.0, own_end - start)
+    if span <= 0:
+        return 0.0
+    tokens = sum(
+        1
+        for index, stamp in enumerate(item["token_times"])
+        if index > 0 and stamp > start
+    )
+    return tokens / span
+
+
 def add_benchmark_args(parser: argparse.ArgumentParser):
     parser.add_argument("--input_tokens", type=int, default=64,
                         help="Input token length for benchmark prompts")
@@ -151,6 +197,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             "output_tokens": 0,
             "finish_code": None,
             "token_ids": [],
+            "token_times": [],
         })
 
     pending = set(range(batch))
@@ -172,6 +219,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
                 item["first_token_time"] = now
             item["output_tokens"] += 1
             item["token_ids"].append(int(token))
+            item["token_times"].append(now)
         if not progressed:
             time.sleep(0.0005)
 
@@ -200,6 +248,11 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         max(item["end_time"] for item in requests) - min(first_token_times)
         if first_token_times else 0.0
     )
+    common_start, common_span, common_tokens = _common_decode_window(
+        requests, batch_end)
+    for item in requests:
+        item["common_decode_tokens_per_second"] = _per_request_common_rate(
+            item, common_start)
     return {
         "label": label,
         "input_tokens": len(input_tokens),
@@ -223,6 +276,12 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         "batch_tokens_per_second": total_output_tokens / max(batch_end - batch_start, 1e-9),
         "batch_decode_tokens_per_second": (
             decode_tokens / max(batch_decode_span, 1e-9) if batch_decode_span > 0 else 0.0
+        ),
+        "common_decode_start": common_start,
+        "common_decode_span": common_span,
+        "common_decode_tokens": common_tokens,
+        "common_decode_tokens_per_second": (
+            common_tokens / common_span if common_span > 0 else 0.0
         ),
         "token_hash": _token_stream_hash(requests),
     }
@@ -307,6 +366,21 @@ def _print_result(result: Dict[str, object]):
     _print_kv("Batch total", _format_tokens_per_second(result["batch_tokens_per_second"]))
     _print_kv("Batch decode after TTFT",
               _format_tokens_per_second(result["batch_decode_tokens_per_second"]))
+    _print_kv("Batch decode (common window)",
+              _format_tokens_per_second(result["common_decode_tokens_per_second"]))
+    if result["batch"] > 1 and result["common_decode_start"] is not None:
+        # Make the window auditable: without it the two decode rows look like
+        # a contradiction rather than a definition difference.
+        _print_kv("  common window", "last TTFT %.2f s + %.2f s, %d tokens" % (
+            result["common_decode_start"] - min(
+                item["start_time"] for item in result["requests"]),
+            result["common_decode_span"],
+            result["common_decode_tokens"],
+        ))
+        for item in result["requests"]:
+            _print_kv("  request #%d in window" % item["request_id"],
+                      _format_tokens_per_second(
+                          item["common_decode_tokens_per_second"]))
     _print_kv("Per request avg",
               _format_tokens_per_second(result["per_request_tokens_per_second_avg"]))
 

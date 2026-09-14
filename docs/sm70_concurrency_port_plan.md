@@ -913,6 +913,67 @@ C=1 80K 是干净的稳定态测量，图在这里的收益（+25.7%）比 8K（
 符合「上下文越长、每 step GPU 服务越长、launch 税占比越稳定」的预期。
 相对 8K 的 72.02 tok/s，80K 只慢约 11%。
 
+**C=2 80K：口径修好后图同样有效，且暴露出 prefill 饿死 decode**
+
+`Batch decode after TTFT` 的窗口从**第一个** TTFT 起算，于是把另一条请求仍在
+跑的 prefill 记进 decode，分子也把被阻塞期间产出的 token 算了进去。C=2 80K
+下这个口径给出的 11 tok/s 没有任何意义。已在 `benchmark.py` 增加
+`Batch decode (common window)`：窗口从**最后一个** TTFT 起算，只统计该时刻
+之后产生的 token，并把窗口长度、token 数与每条请求的窗口内速率一并打印，
+让口径可审计。
+
+| C=2 80K | graph off | graph on | 变化 |
+| --- | ---: | ---: | ---: |
+| `Batch decode after TTFT`（旧口径） | 10.87 tok/s | 11.02 tok/s | 看起来无差异 |
+| **`Batch decode (common window)`** | 97.28 tok/s | **108.46 tok/s** | **+11.5%** |
+| 窗口内单请求 | 48.65 tok/s | **54.23 tok/s** | +11.5% |
+| common window | 83.27 s + 5.24 s | 83.09 s + 4.70 s | — |
+| token sha256 | `ea2857f4…` | `ea2857f4…` | 相同 |
+
+修正后的结论有两条，都与 P0-1 有关：
+
+1. **图在 C=2 80K 同样有效（+11.5%）**。旧口径把这条收益埋在了噪声里，
+   上一轮「图在 C=2 没效果」的判断是基于错误口径得出的，此处更正。
+2. **瓶颈是 prefill 串行，不是 decode**。graph on 时窗口内两条请求各
+   54.23 tok/s、合计 108.46，且 510 个 decode token **全部**落在最后
+   4.70 s 窗口内。反推：请求 #0 在 41.50 s 拿到首 token 之后，到 83.09 s
+   之间**一个 decode token 都没有产出**，整整 41.6 s 被 #1 的 prefill
+   完全饿死（TPOP max 181.51 ms 就是这段全跨度平均）。所以 C=2 80K 的
+   真实形态是「41.6 s 纯 prefill + 4.7 s 全速并发 decode」，而不是
+   「11 tok/s 的慢 decode」。
+
+第 2 条对方案 §8 的 PR0/PR4 是直接输入：并发收益目前被**入队/调度**吃掉，
+而不是被 kernel 吃掉。方案 §16.4 建议里的「chunked prefill / 入队并行」
+从「下一步看」升级为并发路线的主瓶颈。这与方案 16.1 记录的 C=2 80K
+（当时 6.72 tok/s）是同一个成因，本次给出了修正口径下的真实数字。
+
+C=1 80K 在新旧口径下**同为 61.16 tok/s**（同一次运行内两行相等），确认
+改动不影响单请求数字；C=1 旧运行读 64.31 是 run-to-run 抖动，token 流
+sha256 未变。
+
+**边界与残留风险**：
+
+- `Batch decode (common window)` 的窗口终点取**最后一个**请求的结束时间。
+  若 batch 内请求结束时间相差很大，尾部只剩余部分请求在跑，该口径会偏保守
+  （低估）。窗口长度与 token 数已一并打印，便于判断是否属于这种情况。
+- 本机是 16GB 卡。已验证：8K C=1、80K C=1、80K C=2（含 prefill 串行）。
+  **未验证**：C=4/8/16 的固定宽图（方案 §8 的 PR4）、180K/256K 长上下文。
+  高并发 **未验证**，不要把 C=1/C=2 的数字外推。
+- SM70 稳态仍开 `NcclForceSync`（`basellm.cpp` 的 `RuntimeArch() >= 75`
+  守卫）。本项只解锁 decode launch 税，不含 P1-6 的通信重叠；ForceSync
+  收口应在图稳定之后再单独做。
+- 判据是「两路径 greedy 逐 token 相同」+「4 卡无新 Xid」+「其他 api 用例
+  无新增失败」。未做 GSM8K 级质量跑分。
+- C≥2 请以 `Batch decode (common window)` 为准；旧的
+  `Batch decode after TTFT` 保留，是因为方案 16.1 的历史表格用的就是它，
+  删掉会让那些数字失去可比性。它的定义没变，只是在 batch>1 时不代表
+  decode 速率。
+
+回归：`python3 -m unittest test.api.test_qwen35_auto_fast_paths` → 37 passed；
+新增 `test.api.test_benchmark_common_window` → 6 passed（纯计算，无 GPU）。
+全量 `test/api` 除既有 `test_launcher_webui` 18 条（与本改动无关，改动前
+`git stash` 复现同样 18 条失败）外无新增失败。
+
 ### 16.3 未完成（需要 32GB V100 + 完整模型才能验证，本轮刻意未盲改）
 
 **PR0 主体：batched `ForwardBatch`**
@@ -980,7 +1041,13 @@ native unpack 回归（`sm70QpnNvfp4Regression`）：
 
 ### 16.4 下一步建议
 
-1. C=4 长 prompt 已测完到 8K：2048/4096 聚合约 123 tok/s，8K 因串行 prefill 掉到 47 tok/s，仍低于 1Cat 164 tok/s。下一步看 chunked prefill / 入队是否能并行。
+1. **prefill 调度是现在并发路线的主瓶颈**，不是 kernel。80K C=2 的实测形态
+   是「41.6 s 纯 prefill（期间另一条请求被完全饿死、零 decode token）+
+   4.7 s 全速并发 decode（108.46 tok/s）」。8K C=4 的聚合同样被串行
+   prefill 压到 47 tok/s。所以优先级高于再搬 kernel：让 chunked prefill
+   与 decode 能交错入队，而不是先把一条请求的 prefill 跑完。
+   验收口径用 `Batch decode (common window)`，不要再用
+   `Batch decode after TTFT` 判断入队是否改善，后者分不清 prefill 与 decode。
 2. QPN8 FP8 按 16.3 接入 Linear（当前模型是 NVFP4，QPN8 需 FP8 权重才能端到端验证）。
 3. 在 4×V100-**32GB** 上跑通 Qwen4-Exp `--max_batch 4`（PR0 主体）。
 4. 之后按方案第 12 节顺序推进 QPN4 / MoE direct / push AR。
