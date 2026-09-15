@@ -434,6 +434,35 @@ namespace fastllm {
         return maxBatch;
     }
 
+    // Startup memory attribution. FASTLLM_MEM_TRACE=1 makes the model print a
+    // one-line cudaMemGetInfo checkpoint per startup stage, because the
+    // verbose flag is set on the model only after construction and therefore
+    // cannot observe the calibration that decides the KV pool size.
+    static void TraceStartupMemory(const char *stage) {
+        static const bool enabled = [] {
+            const char *env = std::getenv("FASTLLM_MEM_TRACE");
+            return env != nullptr && env[0] != '0';
+        }();
+        if (!enabled) {
+            return;
+        }
+        static std::vector<long long> totalSizes;
+        if (totalSizes.empty()) {
+            totalSizes = FastllmCudaGetTotalSizes();
+        }
+        auto freeSizes = FastllmCudaGetFreeSizes();
+        long long freeMB = 0, totalMB = 0;
+        for (auto v : freeSizes) {
+            freeMB += v >> 20;
+        }
+        for (auto v : totalSizes) {
+            totalMB += v >> 20;
+        }
+        printf("[MEM] %-36s gpuFree=%lld MB / %lld MB (sum over %zu devices)\n",
+               stage, freeMB, totalMB, freeSizes.size());
+        fflush(stdout);
+    }
+
     bool basellm::CanUseGPUForward() const {
         return IsPureGpuMode(this);
     }
@@ -4036,6 +4065,7 @@ namespace fastllm {
     }
 
     void basellm::AutoWarmup() {
+        TraceStartupMemory("AutoWarmup entry (weights loaded)");
         ReportModelLoadProgress("warmup", 0, 1);
         if (GetFastllmEnv().skipWarmup) {
             if (contextPlan.requestedLength > 0) {
@@ -4162,7 +4192,14 @@ namespace fastllm {
 
 #ifdef USE_CUDA
         auto printCudaWarmupPoolStats = [&](const char *stage) {
-            if (!this->verbose) {
+            // Verbose is set on the model only after construction, so startup
+            // calibration cannot be observed through it. FASTLLM_MEM_TRACE
+            // opens the same checkpoints for memory attribution.
+            static const bool memTrace = [] {
+                const char *env = std::getenv("FASTLLM_MEM_TRACE");
+                return env != nullptr && env[0] != '0';
+            }();
+            if (!this->verbose && !memTrace) {
                 return;
             }
             printf("[Fastllm] AutoWarmup CUDA pool after %s:\n", stage);
@@ -5300,6 +5337,7 @@ namespace fastllm {
         }
         printf("finish.\n");
 
+        TraceStartupMemory("after final KV calibration");
         auto *pcm = autoWarmupPagedCacheManager != nullptr ?
             autoWarmupPagedCacheManager : this->GetPagedKVCacheManager(this->kvCacheId, true);
         if (pcm != nullptr) {

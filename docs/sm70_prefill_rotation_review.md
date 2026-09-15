@@ -329,8 +329,61 @@ inFlight 分布:  1 inFlight=4      exit=134（核心已转储）
    每卡要换 328 MB、16 层约 5.2 GB/step，几十到几百毫秒每步，而整个 decode 步
    才 12–17 ms。**加卡也会先撞 PCIe 墙。**
 
-### 3.8 代码处置补充
+### 3.8 那 7.37 GB/卡 的归因（2026-09-15 实测，部分结论）
 
+给启动路径加了内存检查点（`FASTLLM_MEM_TRACE=1`，见 §3.9），得到：
+
+| 节点 | 4 卡合计 gpuFree |
+|---|---:|
+| `AutoWarmup` 入口（权重已加载） | **43100 MB / 64576 MB** |
+| 最终 KV 标定之后 | **4110 MB / 64576 MB** |
+
+**权重加载后**：`64576 − 43100 = 21476 MB` = **5.37 GB/卡**，与 20.56 GB ÷ 4 吻合
+（checkpoint 是 NVFP4，每参数 0.5625 字节）。
+
+**预热过程再吃掉约 9.7 GB/卡**，而最终建成的 KV 页池只有
+`3200 页 × 1.05 MB = 3.36 GB`。所以**其余约 6.3 GB/卡 是预热期留下的池化缓冲**。
+池统计（dev 3）印证：`bigPool: 10708/10962 MB`，即 FastLLM 自己的大缓冲池持有
+约 10.7 GB，其中页池只占 3.36 GB。
+
+**这些缓冲是"缓存"而不是"丢失"**，而且有一条现成的回收路径：
+
+```cpp
+// fastllm-cuda.cu:4955
+static bool FastllmCudaRetryMallocAfterReleasingIdle(...) {
+    // cudaFree is forbidden while a stream is being captured.
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    // Once serving has frozen allocations, idle blocks are the reserve that
+    // future requests must reuse. Releasing them cannot make a forbidden
+    // allocation succeed and would only destroy the warmed pool.
+    if (fastllmCudaMallocDisabled) return false;
+    FastllmCudaReleaseIdleCachedBuffersForDevice(id);   // cudaFree 掉空闲缓冲
+    return FastllmCudaCheckedMalloc(...) == cudaSuccess;
+}
+```
+
+三个条件决定它会不会真的回收：
+
+1. **只在分配失败后触发**——先尝试、失败、才释放空闲缓冲并重试；
+2. **图捕获期禁用**（`FastllmCudaGraphIsCapturingFast`）；
+3. **分配冻结后禁用**。而冻结只在 `FASTLLM_CUDA_MEM_CHECK` 打开时生效
+   （`DisableCudaMalloc` 的守卫），**普通服务不冻结，所以路径是活的**。
+
+**但实测表明它回收不出足够空间**：`--tokens 500000` → 3907 页 exit 0；
+`700000 / 900000 / 1100000` → 全部 `cuda malloc failed`。也就是说即使走 OOM
+重试，空闲缓冲也放不出能装下更大池子的空间——多数大缓冲要么 `busy`，要么被
+CUDA Graph 钉住（`graphPins > 0` / `FastllmCudaGraphPoolPointerProtectedLocked`）。
+
+**所以结论是**：约 6.3 GB/卡 的池化缓冲里，可回收的部分已经体现在 3907 页这个
+上限里；剩下的被图钉住或仍在使用中。**逐缓冲的尺寸分布本轮没量到**（要往
+`FastllmCudaPrintPoolRejectStateLocked` 加一个按需转储），这是开放的下一步，
+也是判断"能不能再挤出 4 GB 给 4×200K"的唯一途径。
+
+### 3.9 代码处置补充
+
+- **新增 `FASTLLM_MEM_TRACE=1`**（缺省关）：让启动期打印每阶段
+  `cudaMemGetInfo` 与池统计。它存在的理由很具体——`verbose` 是在模型构造**之后**
+  才设置的，所以通过它看不到任何标定过程；这个开关补上了那段可观测性。
 - 准入预算**保持 `2 x chunk`**（实测上限：3 条以上 abort）。
 - 预热缓冲与准入预算**已解耦**（`servingPrefillTokenLimit = GetChunkedPrefillSize()`）：
   放宽预算时预热不再同比放大，否则 4x 预算会在第一条请求之前就 OOM
