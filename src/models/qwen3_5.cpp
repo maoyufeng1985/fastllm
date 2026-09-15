@@ -10122,10 +10122,13 @@ namespace fastllm {
         //
         // The explicit chunk size bounds how much one request may feed, but it
         // is also what makes a second long prompt compute a zero-length chunk
-        // and get skipped every round. Rotating between two in-flight prefills
-        // needs room for two slices in one budget, so rotation raises the
-        // admission budget to two chunks. Slices stay whole, so a forward
-        // still carries one chunk per request, not a split chunk.
+        // and get skipped every round. Rotating between in-flight prefills
+        // needs room for one slice per request in a single budget, so rotation
+        // admits two slices. The cap is deliberate: three or more chunks in one
+        // forward abort in the batched prefill path (measured), while two are
+        // exercised by batch-2 decode and prefill every day. The eager prefill
+        // warmup sizes its scratch by the chunk, so a wider budget would not
+        // grow per-forward activation memory either way.
         if (PrefillRotationEnabled()) {
             return 2 * this->GetChunkedPrefillSize();
         }
@@ -10548,12 +10551,13 @@ namespace fastllm {
             int eagerWarmupBatch =
                 this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
             eagerWarmupBatch = std::max(1, eagerWarmupBatch);
-            // The scheduler may aggregate unrelated prompts up to a larger
-            // token budget than the per-request chunk size when an explicit
-            // prefix-snapshot interval clamps GetChunkedPrefillSize().
-            int servingPrefillTokenLimit = std::max(
-                this->GetChunkedPrefillSize(),
-                this->GetBatchedPrefillTokenLimit());
+            // The scheduler may aggregate several requests into one forward,
+            // but every forward carries whole per-request slices of at most
+            // GetChunkedPrefillSize() tokens each. Size the eager scratch by
+            // one slice: sizing it by the admission budget made the scratch
+            // grow with the number of admitted requests and pushed long-context
+            // runs into OOM before the first request could run.
+            int servingPrefillTokenLimit = this->GetChunkedPrefillSize();
             int eagerWarmupTokens = std::max(eagerWarmupBatch,
                                              servingPrefillTokenLimit);
             int warmupTokenLimit = this->tokensLimit > 0
