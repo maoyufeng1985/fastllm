@@ -178,6 +178,75 @@ FASTLLM_PREFILL_ROTATE=1 FASTLLM_SCHED_TRACE=1 python3 -m ftllm.cli benchmark \
 - 一旦让两条同时 in-flight（轮转或放预算），就踩到它；
 - 这也解释了 §3.1 的假象：当时我以为改预算就能复现，其实那两次是脏构建。
 
+## 3.6 服务模式验收（2026-09-15，真实到达模式）
+
+benchmark 的 `--batch 2` 是**同时**提交两条，TTFT 243–255 s 对两条都成立。真实
+服务里请求是陆续到的，形状不同，所以单独验了一次。
+
+### 配置
+
+```sh
+FASTLLM_PREFILL_ROTATE=1 python3 -m ftllm.cli serve \
+  /home/models/Qwen3.8-27B-QUASAR-NVFP4 --tp 4 --cuda_embedding --max_batch 2 \
+  --tokens 409600 --gpu_mem_ratio 0.97 --kv_cache_dtype fp8_e4m3 --dtype auto \
+  --enable_thinking false --prefix_cache false --port 18123 --host 127.0.0.1
+```
+
+两条 200K 请求错开 5 s 发出（`/v1/chat/completions`）。
+
+### 结果：第一条不再吃满 2x 惩罚
+
+| 请求 | 发出 | 耗时 | 状态 |
+|---|---:|---:|---|
+| A | t+0 s | **247.8 s** | ok |
+| B | t+5 s | **243.0 s** | ok |
+
+服务端 trace：`inFlight=2` **90 轮**，且前 6 轮是 `orders=1 / inFlight=1`——
+A 独占了相当于到达间隔的时间，B 到达后才开始交替：
+
+```
+it=0..5  orders=1 selected=1 sel=0 inFlight=1   ← A 独跑
+it=6     orders=2 selected=2 sel=0 inFlight=2   ← B 到达，两条并排
+it=7..   orders=2 selected=2 sel 在 0/1 交替
+```
+
+**这一点纠正了 benchmark 给人的印象**：同时提交时两条都等 ~253 s，而错开到达时
+A 只等 247.8 s、B 243.0 s——**接近"各付一半"，不是"第一条翻倍"**。轮转让后到
+的请求快速追上，同时先到的请求保留它抢跑的那一点。
+
+### 显存：峰值由池子决定，不由在飞请求数决定
+
+逐秒采样（1 s 间隔）：
+
+| 场景 | GPU0 峰值 | 余量 |
+|---|---:|---:|
+| 单条 200K | 15711 MiB | 673 MiB |
+| 两条错开到达 | 15711 MiB | 673 MiB |
+| 同时提交（benchmark） | 15707 MiB | 677 MiB |
+
+**三者完全相同。** 原因是页池在启动时按 `--tokens` 分配，空闲页不省显存：
+`--tokens 409600` → 3200 页 × 1.05 MB = **3.36 GB**，与请求数无关。
+
+所以：
+
+- 这里的 673 MiB 余量**不是"还有空间"**，池子已经按上限落地了；
+- **省显存只能靠右调 `--tokens`**，而 2×200K 需要 3126 页、除以 80% 上限
+  （`promptLimit = totalPages * 4 / 5`）得池子 ≥3908 页，**409600 已经是下限**，
+  没有可回收的余量。要更多余量只能减少每条请求的上下文或换卡。
+
+### 天花板：2 并发是硬的，第三条被排队
+
+三条 200K 错开 4 s 到达：
+
+| 请求 | 耗时 | 状态 |
+|---|---:|---|
+| R0 | 248.3 s | ok |
+| R1 | 248.4 s | ok |
+| R2 | **364.6 s** | ok（被排到后面） |
+
+R2 多等约 116 s，说明它没有和前两条重叠——池子装不下第三条的 1563 页。
+服务没崩、请求没失败，是页池不足的正确降级。**所以 200K 档的并发上限就是 2。**
+
 ## 4. 轮转的收益：只有公平性，没有吞吐
 
 两条 200K 的 prefill 吃同一份算力，总计算量不变，所以：
