@@ -15345,6 +15345,14 @@ namespace fastllm {
                                                      curPositionIds, curSeqLens,
                                                      curPastKeyValues, curGenerationConfigs,
                                                      curLastTokens, curLogitsPtr);
+                // An intermediate chunked-prefill round deliberately yields no
+                // token: ForwardSingleGPU clears the logits and returns empty.
+                // The batch-1 and the ForwardV2 paths already propagate that
+                // empty result; this split path must too instead of reading
+                // index 0 of an empty vector.
+                if (curRet.empty()) {
+                    continue;
+                }
                 ret.push_back(curRet[0]);
             }
             return ret;
@@ -32581,6 +32589,11 @@ namespace fastllm {
                     1, curInputIds, curAttentionMask, curPositionIds, curSeqLens,
                     curPastKeyValues, curGenerationConfigs, curLastTokens, curLogitsPtr
                 );
+                // Same as the ForwardGPUWithHiddenStates split path: an
+                // intermediate chunked-prefill round returns no token.
+                if (curRet.empty()) {
+                    continue;
+                }
                 ret.push_back(curRet[0]);
             }
             return ret;
