@@ -2841,6 +2841,62 @@ __global__ void FastllmPagedAttentionCombineGQAKernel(
     }
 }
 
+// phase2（GQA）并行版：与 CombineGQAKernel 逐位等价，只把它没开的并行度打开。
+// 旧版 grid=(batch, numKvHeads)，block=headDim；TP4 下每 rank 只有 1 个 kv head，
+// 于是整个 kernel 只有一个 256 线程的 block，块内还串行 group 个 Q head，且每个
+// 线程对每个 d 都把 S 个 exp2f 因子重算一遍（256 线程重复同样的 192 次 exp2f）。
+// 新版把 Q head 提到 grid.y、把 headDim 切成 dimChunks 放到 grid.z，因子在 shared
+// 里只算一次。max 扫描与 L 的顺序累加仍按原顺序、原值，因此输出逐位相同。
+template <typename QType>
+__global__ void FastllmPagedAttentionCombineGQAParallelKernel(
+    const float *scratch,
+    QType *od,
+    const int32_t *qSizes,
+    int H, int headDim, int S, int dimChunk) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int token = qSizes[b];
+    int headDimPlus = headDim + 2;
+    const float *base = scratch + ((size_t)(b * H + h) * S) * headDimPlus;
+
+    __shared__ float sMs[FASTLLM_PAGED_MAX_SPLITS];
+    __shared__ float sLs[FASTLLM_PAGED_MAX_SPLITS];
+    __shared__ float sFactors[FASTLLM_PAGED_MAX_SPLITS];
+
+    for (int s = tid; s < S; s += blockDim.x) {
+        sMs[s] = base[(size_t)s * headDimPlus + headDim];
+        sLs[s] = base[(size_t)s * headDimPlus + headDim + 1];
+    }
+    __syncthreads();
+
+    // 与原 kernel 相同的顺序与取值，每个线程算一遍（全 block 值一致）。
+    float M = -1e30f;
+    for (int s = 0; s < S; s++) {
+        M = fmaxf(M, sMs[s]);
+    }
+    float L = 0.0f;
+    for (int s = 0; s < S; s++) {
+        L += sLs[s] * exp2f(sMs[s] - M);
+    }
+    for (int s = tid; s < S; s += blockDim.x) {
+        sFactors[s] = exp2f(sMs[s] - M);
+    }
+    __syncthreads();
+
+    const int dBase = blockIdx.z * dimChunk;
+    const int dEnd = min(dBase + dimChunk, headDim);
+    for (int d = dBase + tid; d < dEnd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int s = 0; s < S; s++) {
+            o += base[(size_t)s * headDimPlus + d] * sFactors[s];
+        }
+        o = (L > 0.0f) ? (o / L) : 0.0f;
+        od[(size_t)token * H * headDim + (size_t)h * headDim + d] =
+            FastllmAttentionFloatToValue<QType>(o);
+    }
+}
+
 template <typename QType>
 static void FastllmCudaPagedAttentionBatchGqaLaunch(
     fastllm::Data &q, fastllm::Data &output,
@@ -3118,9 +3174,32 @@ static void FastllmCudaPagedAttentionSplitLaunch(
         FastllmPagedAttentionCombineExp2OutputKernel<QType><<<grid3, 256>>>(
             scratch, combineStats, od, qSizesData, H, headDim, S);
     } else if (useSm7xGqaD256) {
-        grid2.y = (unsigned int)numKvHeads;
-        FastllmPagedAttentionCombineGQAKernel<QType, 6><<<grid2, block2>>>(
-            scratch, od, qSizesData, H, group, headDim, S);
+        // 旧的 GQA combine 在 TP4 下只有 1 个 block（每 rank 1 个 kv head），
+        // 把 Q head 提到 grid.y、dim 切成 grid.z 后并行度回到 H×dimChunks。
+        // 数值路径与旧 kernel 相同，设 FASTLLM_PAGED_COMBINE_GQA_PARALLEL=0 回退。
+        const char *parallelEnv =
+            std::getenv("FASTLLM_PAGED_COMBINE_GQA_PARALLEL");
+        const bool useParallelCombine = parallelEnv == nullptr ||
+            parallelEnv[0] != '0';
+        int dimChunk = 128;
+        if (const char *chunkEnv = std::getenv("FASTLLM_PAGED_COMBINE_DIM_CHUNK")) {
+            int parsed = atoi(chunkEnv);
+            if (parsed > 0 && parsed <= headDim) {
+                dimChunk = parsed;
+            }
+        }
+        if (useParallelCombine) {
+            dim3 gridP(batch_size, (unsigned int)H,
+                       (unsigned int)((headDim + dimChunk - 1) / dimChunk));
+            dim3 blockP((unsigned int)std::min(dimChunk, 256), 1, 1);
+            FastllmPagedAttentionCombineGQAParallelKernel<QType>
+                <<<gridP, blockP>>>(scratch, od, qSizesData, H, headDim, S,
+                                    dimChunk);
+        } else {
+            grid2.y = (unsigned int)numKvHeads;
+            FastllmPagedAttentionCombineGQAKernel<QType, 6><<<grid2, block2>>>(
+                scratch, od, qSizesData, H, group, headDim, S);
+        }
     } else if (useGqa) {
         grid2.y = (unsigned int)numKvHeads;
         if (group == 2) {

@@ -565,6 +565,94 @@ static void RunFusedCase(fastllm::DataType dtype, bool yarn = false) {
     std::printf("fused FP4 append and graph replay passed: dtype=%d yarn=%d\n", int(dtype), int(yarn));
 }
 
+// The SM70 GQA D256 combine used to run as a single block per (batch, kvHead),
+// which is one block at TP4. It is now split across Q heads and dim chunks.
+// Both kernels must produce identical bits, so run the same inputs twice with
+// FASTLLM_PAGED_COMBINE_GQA_PARALLEL toggled and diff the outputs.
+template <typename T>
+static void RunCombineParallelParityCase(fastllm::DataType dtype, int dim = 256,
+                                         int group = 6, int tokens = 4097,
+                                         int pageLen = 128) {
+    using namespace fastllm;
+    const int heads = 1, qHeads = heads * group;
+    const int pages = (tokens + pageLen - 1) / pageLen;
+    const size_t pageElements = pageLen * heads * dim;
+    PagedCacheManager kp, vp;
+    std::vector<half> hostK(pages * pageElements), hostV(pages * pageElements);
+    for (auto *pool : {&kp, &vp}) {
+        pool->dataType = DataType::FLOAT16;
+        pool->UpdateUnitSize();
+        pool->Resize({pages, pageLen, heads, dim});
+        AllocateGpu(*pool);
+    }
+    for (size_t i = 0; i < hostK.size(); ++i) {
+        hostK[i] = __float2half(std::sin(float(i) * 0.031f) * 0.5f);
+        hostV[i] = __float2half(std::cos(float(i) * 0.017f) * 0.5f);
+    }
+    Check(cudaMemcpy(kp.cudaData, hostK.data(), hostK.size() * sizeof(half),
+                     cudaMemcpyHostToDevice));
+    Check(cudaMemcpy(vp.cudaData, hostV.data(), hostV.size() * sizeof(half),
+                     cudaMemcpyHostToDevice));
+
+    Data q(dtype, {qHeads, 1, dim}), out(dtype, {qHeads, 1, dim});
+    AllocateGpu(q);
+    AllocateGpu(out);
+    std::vector<T> hostQ(q.Count(0));
+    for (size_t i = 0; i < hostQ.size(); ++i) {
+        hostQ[i] = T(std::sin(float(i) * 0.023f) * 0.25f);
+    }
+    Check(cudaMemcpy(q.cudaData, hostQ.data(), q.GetBytes(), cudaMemcpyHostToDevice));
+
+    Data k(dtype), v(dtype);
+    for (auto *cache : {&k, &v}) {
+        cache->Resize({heads, tokens, dim});
+        cache->isPagedKVCache = true;
+        cache->pageLen = pageLen;
+        cache->lastPageLen = (tokens - 1) % pageLen + 1;
+    }
+    k.pagedKVCacheData = &kp;
+    v.pagedKVCacheData = &vp;
+    std::vector<int> pageIds(pages), pageSizes(pages + 1, 0);
+    for (int p = 0; p < pages; ++p) {
+        pageIds[p] = p;
+        pageSizes[p + 1] = p + 1;
+    }
+    Data qs, ps, ids, last;
+    InitInt(qs, {0, 1});
+    InitInt(ps, pageSizes);
+    InitInt(ids, pageIds);
+    InitInt(last, {(tokens - 1) % pageLen + 1});
+    const float scale = 1 / std::sqrt(float(dim));
+
+    auto run = [&](const char *mode) -> std::vector<T> {
+        setenv("FASTLLM_PAGED_COMBINE_GQA_PARALLEL", mode, 1);
+        Check(cudaMemset(out.cudaData, 0, out.GetBytes()));
+        Require(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                    q, k, v, qs, ps, ids, last, out, group, scale),
+                "sm70 d256 combine attention failed");
+        Check(cudaDeviceSynchronize());
+        std::vector<T> values(out.Count(0));
+        Check(cudaMemcpy(values.data(), out.cudaData, out.GetBytes(),
+                         cudaMemcpyDeviceToHost));
+        return values;
+    };
+    auto parallel = run("1");
+    auto serial = run("0");
+    unsetenv("FASTLLM_PAGED_COMBINE_GQA_PARALLEL");
+    size_t diff = 0;
+    float maxError = 0;
+    for (size_t i = 0; i < parallel.size(); ++i) {
+        if (parallel[i] != serial[i]) {
+            ++diff;
+        }
+        maxError = std::max(maxError, std::fabs(float(parallel[i]) - float(serial[i])));
+    }
+    std::printf("combine parallel parity dtype=%d dim=%d group=%d tokens=%d "
+                "bits_diff=%zu max_error=%g\n",
+                int(dtype), dim, group, tokens, diff, maxError);
+    Require(diff == 0, "parallel combine differs bitwise from serial combine");
+}
+
 int main() {
     try {
         int devices = 0;
@@ -612,6 +700,8 @@ int main() {
         RunFusedCase<__nv_bfloat16>(fastllm::DataType::BFLOAT16);
         RunFusedCase<half>(fastllm::DataType::FLOAT16, true);
         RunFusedCase<__nv_bfloat16>(fastllm::DataType::BFLOAT16, true);
+        RunCombineParallelParityCase<half>(fastllm::DataType::FLOAT16);
+        RunCombineParallelParityCase<__nv_bfloat16>(fastllm::DataType::BFLOAT16);
         std::puts("FP4 KV cache tests passed");
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
