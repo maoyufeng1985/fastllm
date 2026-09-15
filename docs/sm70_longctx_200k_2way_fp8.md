@@ -47,7 +47,7 @@ SCHED_TRACE 佐证：`canAddPrefill=1` 全程为真（页子够），但 187 次
 | 准入预算 | chunk | 结果 |
 |---:|---:|---|
 | 4608 | 2048 | OOM：`cuda malloc failed ... dims=[1, 4608, 8704]`（80 MB）|
-| 2112 | 1024 | **Xid 31（GPU MMU 故障）+ 段错误**，崩在 `ragged batched serving` 预热之后 |
+| 2112 | 1024 | **段错误**（主机侧）。初版把它记成"Xid 31 + 段错误"是**误合并**：dmesg 里那条 Xid 属于九分钟前的另一跑（OOM kill 的 teardown 产物）。**更正见 §7** |
 
 第二档的 dmesg：
 
@@ -64,7 +64,7 @@ total tokens 2112` → `[sched] it=1 orders=2 selected=2` → 崩。**"两条 ch
 1. 抬高准入预算会让 warmup 缓冲区同比放大（`servingPrefillTokenLimit` 取
    `GetBatchedPrefillTokenLimit()`，`qwen3_5.cpp:10558-10562`），而卡上只剩
    几 MB 余量；
-2. 就算放进去，ragged batched prefill 那条路径自身有 bug（Xid 31）。
+2. 就算放进去，分叉批量前向对空返回取下标 0 会崩（主机侧空指针，**不是 GPU bug**，已修，见 §7）。
 
 ### 处置
 
@@ -76,9 +76,13 @@ GPU MMU 故障说明是地址记账错了，不是参数没调好。
 
 - **200K × 1 并发：可行**（FP8 或 FP16 都能跑，FP16 单条实测 TTFT 127.6 s）。
 - **200K × 2 并发：当前不可行**，卡在调度器准入，不在显存。
-- 若坚持要 2 并发，需要先修 ragged batched prefill 的地址记账（Xid 31）并把
-  warmup 缓冲与准入预算解耦，这是一项独立工作，收益是 TTFT 公平性（两条都会
-  在 ~128 s 附近出首 token）而不是吞吐（两条总计算量不变）。
+- 若坚持要 2 并发：**两个障碍都已清掉**——warmup 缓冲与准入预算的解耦，
+  以及分叉批量前向的空返回（已修，提交 `56e3445f`）。用
+  `FASTLLM_PREFILL_ROTATE=1` 实测该组合已真正并发（`inFlight=2` 97 轮、
+  TTFT 253.3 / 254.6 s）。但**收益是 TTFT 公平性而不是吞吐**：Total time 与
+  串行相同（约 255 s），而 #0 的 TTFT 从 127.4 s 变慢到 253.3 s。所以缺省
+  关闭，只在并发长请求是常态时开启。详见
+  `docs/sm70_prefill_rotation_review.md` §3.4。
 - 更省事的方向：**减少每条请求的上下文**。按可用池子反推，4 并发各约 50K 是
   这台机器的现实上限。
 
@@ -87,3 +91,22 @@ GPU MMU 故障说明是地址记账错了，不是参数没调好。
 整合稿 §3.3 曾把"8K 并发撞权重带宽墙"写成待裁决；同日 U0 已裁决为
 **权重近似全额摊销**（C=2 步长 1.07×、C=4 步长 1.26×），本节的长上下文现象
 与它不矛盾：200K 的串行是**准入/内存**问题，不是权重带宽问题。
+
+## 7. 更正：Xid 31 与段错误不是同一件事（2026-09-15）
+
+本文件初版把 14:xx 那跑的 dmesg 末 5 行读成"Xid 31（GPU MMU 故障）+ 段错误"，
+并据此写下"ragged batched prefill 的地址记账有 bug"。**两处都错**：
+
+1. **Xid 31 属于另一跑。** dmesg 里那条 Xid 的时间戳对应九分钟前的
+   `--chunked_prefill_size 4096` 跑，它 `selected=2` 为 0、死在
+   `cuda malloc failed ... dims=[4,1,2560,4]`（OOM）。崩溃那跑（PID 1884021，
+   19:10:22）的**时间窗内没有 Xid**。
+2. **合并的原因**：当时执行的是 `dmesg | tail -5`，而末 5 行恰好是九分钟前那条
+   Xid 的 3 行加当下段错误的 2 行，于是两件事被读成一件。
+3. **Xid 31 在本机的已知来源**是 OOM kill 的 teardown，不是数据故障：
+   `sm70_npad_ar_chunk_landing_plan.md:554` 已经记录过同一现象
+   （"进程被杀，teardown 产生 Xid 31 MMU fault"）。
+
+**真实根因是主机侧空指针**：`runSplitBatchForward` 对空向量取下标 0。已修，
+提交 `56e3445f`。**"需要修 GPU 地址记账"这个结论会让人去查一个不存在的 GPU
+bug**，特此撤回。

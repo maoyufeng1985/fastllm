@@ -11,10 +11,13 @@
    80K 请求来回 ping-pong 2048 的块"。
 2. **串行已被两组独立数据确认**：`inFlight` 在任何一轮都不超过 1；2×20K 的
    TTFT 是 8.2 s 对 16.5 s（正好一倍）。
-3. **轮转实现了，而且它暴露了一个真 bug，不是避开一个。** 轮转（本仓库新增
-   `FASTLLM_PREFILL_ROTATE`）让 `inFlight` 第一次达到 **2**——两条长 prefill
-   真正同时在飞——而那一刻**段错误**（§3.2）。所以"两条同时 in-flight"是坏的，
-   串行一直在掩盖它。§3.1 还更正了本文件初版的两条假复现。
+3. **轮转实现了，它暴露了一个真 bug，然后这个 bug 修好了。** 轮转让
+   `inFlight` 第一次达到 **2**——两条长 prefill 真正同时在飞——而那一刻**段错误**。
+   根因是主机侧空指针（分叉批量前向对空返回取下标 0），不是 GPU 故障；已修
+   （提交 `56e3445f`）。修后 2×200K × FP8 真正并发：`inFlight=2` 97 轮、
+   TTFT 253.3/254.6 s（§3.3、§3.4）。
+4. **但它的收益只有公平性。** Total time 与串行相同（约 255 s），#0 的 TTFT
+   从 127.4 s 变慢到 253.3 s。所以缺省关闭，只在并发长请求是常态时开。
 4. **但轮转买不到吞吐。** 两条长请求的 prefill 总计算量不变，轮转只改变谁先
    完成：后者 TTFT 显著改善，**前者 TTFT 等比例变差**。净效果是延迟的再分配。
 
@@ -83,7 +86,77 @@ FP8 KV、`--tokens 500000`、`--batch 2`、`--input_tokens 200000`：
 两次复跑都不崩。当时的库处于**撤改代码后重建的中间状态**，所以那两条是脏构建
 的假象。**更正：不能用它们支撑"同批两条必崩"的结论。**
 
-### 3.2 真复现：两条 in-flight prefill 会崩
+### 3.2 根因：分叉批量前向对空返回取 [0]（已修复，提交 `56e3445f`）
+
+崩溃不是 GPU 故障，是主机侧空指针读取，落在 `runSplitBatchForward`：
+
+```cpp
+std::vector<int> curRet = ForwardGPU(1, ...);
+ret.push_back(curRet[0]);   // 空向量的 _M_start 为 0 -> 读地址 0
+```
+
+两处同样写法：`ForwardGPUWithHiddenStates`（原 15348）与 `ForwardV2` 副本
+（原 32584）。
+
+机制链条，每环都在代码里核过：
+
+1. 调度器在 `skipIntermediateHead` 为真时经 `IntermediatePrefillGuard` 置位
+   `isIntermediateChunkedPrefill`（`qwen3_5.cpp:23068-23090`）。该条件要求
+   **全部被选中的请求都贪心、且 `prefillRemaining > seqLens[i]`**（23073）——
+   也就是两条都在分块 prefill 中途。
+2. `ForwardSingleGPU`（15126）据此 `logits.FreeSpace()` 并 `return {}`。
+   **中间分块本来就不该产出 token，空返回是既有协议**：batch-1 路径与
+   `ForwardV2`（32592 直接 `return chunkRet`）都这么传播。
+3. `canRunFusedBatchPrefill` 对**已分配 GDN 状态**的线性层返回假
+   （15408-15410，注释写明 "continued or chunked request keeps the
+   request-local path"），于是 `ForwardGPUWithHiddenStates` 走
+   `return runSplitBatchForward()`（15425）。
+4. 分叉路径逐条调 `ForwardGPU(1, ...)`，拿到空向量后仍取 `[0]`，崩。
+
+**修法是跳过而不是兜零**：兜零会往调度器塞一个假 token，而这一轮本就不该有
+token。两处都加 `if (curRet.empty()) continue;`。
+
+**这条更正了本文件初版的一个论断**：初版说"同批两条 prefill 是一条从未走过的
+路径"。不成立——分叉路径本身是常规路径，批量 decode 也走它；没被走过的是
+"**两条同时在分块中途 + 分叉路径 + 跳过 head**"这个组合。而缺省的准入预算
+（只放一条 chunk）恰好让这个组合不可达，所以串行一直在掩盖它。
+
+**为什么热启动没覆盖**：`ragged batched serving` 预热确实跑过一个 4 条序列的
+ragged eager prefill，但它用自己新建的连续 KV `Data`，不碰分页管理器，也从不
+设置 `isIntermediateChunkedPrefill`，所以到不了那个 `return {}`。它覆盖了形状，
+没覆盖状态。
+
+### 3.3 修复后的实测（2×20K，轮转开）
+
+| 指标 | 串行缺省 | 轮转（修复前） | 轮转（修复后） |
+|---|---|---|---|
+| exit | 0 | **139 段错误** | **0** |
+| `inFlight=2` 轮数 | 0 | 2 | **10** |
+| TTFT min / max | 8199 / 16495 ms | — | **16358 / 16361 ms** |
+| `before last TTFT` | 10 / 0 | — | **0 / 0** |
+| Total time | 16.90 s | — | 16.77 s |
+| 逐请求窗口速率 | 74.73 / 77.01 | — | 75.17 / 75.11 |
+
+**轮转前后 sha 完全相同（`3c051feffab1db8c`）**，与改动前也相同——轮转是纯调度
+改动，不换数值。缺省（轮转关）回归：exit 0、Total time 16.8850 s、`inFlight`
+上限 1，与改动前一致。
+
+### 3.4 目标组合：2×200K × FP8 现在真正并发
+
+```
+FASTLLM_PREFILL_ROTATE=1
+--tokens 409600 --gpu_mem_ratio 0.98 --kv_cache_dtype fp8_e4m3
+--input_tokens 200000 --output_tokens 8 --batch 2 --max_batch 2
+```
+
+**exit 0、阻塞 0、无 OOM**，`inFlight=2` 出现 **97 轮**，TTFT **253.3 s /
+254.6 s**（两条同时出首 token），窗口内逐请求 26.24 / 26.14 tok/s。
+
+对照串行：TTFT 127.4 s / 254.8 s，Total time 约 255 s。**两者 Total time 相同，
+轮转买到的是公平性，#0 的 TTFT 变慢一倍。** 所以缺省必须保持关闭：单条长请求
+是常态时轮转纯亏。
+
+### 3.5 真复现（保留作回归样本）：两条 in-flight prefill 会崩
 
 干净源码、`FASTLLM_PREFILL_ROTATE=1`（轮转把预算抬到 2×chunk，让两条同时
 in-flight）后，最小样本段错误：
