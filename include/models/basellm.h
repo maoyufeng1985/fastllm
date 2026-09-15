@@ -53,6 +53,12 @@ namespace fastllm {
 
         int cacheLen = 0;
 
+        // Unfed prompt tokens while RunNewMainLoop is selection-chunking a
+        // long prefill. 0 means not in that state (short prompt, decode, or
+        // FASTLLM_LONG_PREFILL_CHUNK=0). While >0 it equals currentTokens.size()
+        // and the request stays prefill-eligible even after preTokens > 0.
+        int prefillRemaining = 0;
+
         ~ResponseContext();
 
         void Init(int blocks, DataType dataType, DataType kvCacheDataType);

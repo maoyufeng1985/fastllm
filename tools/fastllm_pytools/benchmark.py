@@ -50,6 +50,26 @@ def _common_decode_window(requests: List[Dict[str, object]],
     return start, span, tokens
 
 
+def _decode_tokens_before_last_ttft(requests: List[Dict[str, object]],
+                                    last_ttft: Optional[float]) -> List[int]:
+    """Generated tokens (not the first) stamped before the last request's TTFT.
+
+    For C=2 this is the plan's yield gate: request #0 must keep decoding while
+    #1 is still prefilling. Common-window rates start at last TTFT, so they
+    cannot see that window.
+    """
+    if last_ttft is None:
+        return [0 for _ in requests]
+    counts = []
+    for item in requests:
+        counts.append(sum(
+            1
+            for index, stamp in enumerate(item["token_times"])
+            if index > 0 and stamp < last_ttft
+        ))
+    return counts
+
+
 def _per_request_common_rate(item: Dict[str, object], start: Optional[float]) -> float:
     """Decode rate for one request measured inside the common window."""
     if start is None:
@@ -250,9 +270,12 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
     )
     common_start, common_span, common_tokens = _common_decode_window(
         requests, batch_end)
-    for item in requests:
+    last_ttft = max(first_token_times) if first_token_times else None
+    decode_before_last = _decode_tokens_before_last_ttft(requests, last_ttft)
+    for item, before in zip(requests, decode_before_last):
         item["common_decode_tokens_per_second"] = _per_request_common_rate(
             item, common_start)
+        item["decode_tokens_before_last_ttft"] = before
     return {
         "label": label,
         "input_tokens": len(input_tokens),
@@ -283,6 +306,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         "common_decode_tokens_per_second": (
             common_tokens / common_span if common_span > 0 else 0.0
         ),
+        "decode_tokens_before_last_ttft": decode_before_last,
         "token_hash": _token_stream_hash(requests),
     }
 
@@ -381,6 +405,10 @@ def _print_result(result: Dict[str, object]):
             _print_kv("  request #%d in window" % item["request_id"],
                       _format_tokens_per_second(
                           item["common_decode_tokens_per_second"]))
+        before = result.get("decode_tokens_before_last_ttft") or []
+        for item, count in zip(result["requests"], before):
+            _print_kv("  request #%d before last TTFT" % item["request_id"],
+                      "%d tokens" % count)
     _print_kv("Per request avg",
               _format_tokens_per_second(result["per_request_tokens_per_second_avg"]))
 

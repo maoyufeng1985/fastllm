@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "qwen3_5.h"
+#include "longPrefillChunk.h"
 #include "models/qwen3_5_paged_cache.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
@@ -21329,6 +21330,13 @@ namespace fastllm {
         const int mtpBatchDecodeTokens = std::min(
             mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        // Selection chunking on the no-MTP handoff path only. Real MTP/DFlash
+        // still admit the whole prompt so the inner split can seed draft KV.
+        const bool longPrefillChunk =
+            LongPrefillChunkEnabled(prefillChunkSize) &&
+            mtpDraftsPerStep == 0 &&
+            !schedulerUsesDFlash;
+        bool activePrefillNeedsDecode = false;
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
@@ -21387,6 +21395,7 @@ namespace fastllm {
             ctx->currentTokens = ctx->allTokens;
             ctx->preTokens = 0;
             ctx->cacheLen = 0;
+            ctx->prefillRemaining = 0;
             ctx->intParams.clear();
         };
 
@@ -22024,6 +22033,10 @@ namespace fastllm {
         } else if (model->verbose) {
             printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
         }
+        printf("[Fastllm] Long prefill chunk: %s, size=%d, batch token limit=%d, scheduler=Qwen35MTPLoop.\n",
+               longPrefillChunk ? "on" : "off",
+               prefillChunkSize,
+               model->GetBatchedPrefillTokenLimit());
         if (model->verbose && useMtpBatchScheduling &&
             mtpDraftsPerStep + 1 > QWEN35_MTP_FAST_SEQ_MAX) {
             printf("[Qwen3.5 MTP] batched validation uses %d of %d configured drafts per step.\n",
@@ -22107,7 +22120,8 @@ namespace fastllm {
             if (!gpuTokenHandoffConfigured || ctx == nullptr) {
                 return false;
             }
-            if (ctx->isAbort || ctx->isEnding || ctx->preTokens <= 0) {
+            if (ctx->isAbort || ctx->isEnding || ctx->preTokens <= 0 ||
+                ctx->prefillRemaining > 0) {
                 return false;
             }
             if (!Qwen35GpuTokenHandoffSupportsGenerationConfig(
@@ -22377,6 +22391,7 @@ namespace fastllm {
             int busyPages = 0;
             int currentActivate = 0;
             bool hasPrefill = false;
+            bool hasInFlightPrefill = false;
             struct DecodeOrder {
                 int sortKey;
                 int handle;
@@ -22406,13 +22421,23 @@ namespace fastllm {
                     eraseMtpCache(ctx);
                     continue;
                 }
-                if (ctx->preTokens > 0) {
-                    currentActivate++;
+                {
+                    auto role = ClassifyRequest(ctx, longPrefillChunk);
+                    if (role.isDecodeActive) {
+                        currentActivate++;
+                    }
+                    if (role.isPromptEligible) {
+                        hasPrefill = true;
+                    }
+                    if (role.inFlightPrefill) {
+                        hasInFlightPrefill = true;
+                    }
+                    orders.push_back({
+                        longPrefillChunk ?
+                            PrefillOrderSortKey(ctx) :
+                            -scheduledDecodeTokens(ctx),
+                        it.first, ctx});
                 }
-                if (ctx->preTokens == 0) {
-                    hasPrefill = true;
-                }
-                orders.push_back({-scheduledDecodeTokens(ctx), it.first, ctx});
             }
             for (int handle : abortHandles) {
                 model->RemoveResponseContext(handle);
@@ -22450,6 +22475,7 @@ namespace fastllm {
             if (handoffIdlePrefillBatchWaitUs > 0 &&
                 forcedGpuTokenHandoffHandles.empty() &&
                 currentActivate == 0 && hasPrefill &&
+                !hasInFlightPrefill &&
                 (int)orders.size() < mtpSchedulerLanes) {
                 auto now = std::chrono::steady_clock::now();
                 if (handoffIdlePrefillBatchHardDeadline ==
@@ -22502,6 +22528,13 @@ namespace fastllm {
             // scheduler capacity.
             bool canAddPrefill = currentActivate < mtpSchedulerLanes &&
                 ((pagesLimit > 0) ? (busyPages < pagesLimit) : true);
+            if (currentActivate == 0) {
+                activePrefillNeedsDecode = false;
+            }
+            const int activeBeforeSelection = currentActivate;
+            const bool forceDecodeThisIteration =
+                ShouldForceDecodeThisIteration(
+                    activeBeforeSelection, hasPrefill, activePrefillNeedsDecode);
             bool gpuTokenHandoffAllRunnable =
                 !orders.empty() &&
                 (int)orders.size() <= mtpSchedulerLanes;
@@ -22525,11 +22558,14 @@ namespace fastllm {
                 if (!forcedGpuTokenHandoffHandles.empty() && isPrompt != 0) {
                     continue;
                 }
-                if (isPrompt == 1 && !canAddPrefill) {
+                if (isPrompt == 1 && forceDecodeThisIteration) {
+                    continue;
+                }
+                if (isPrompt == 1 && !canAddPrefill && !hasInFlightPrefill) {
                     continue;
                 }
                 if (isPrompt == 0 && hasPrefill && canAddPrefill &&
-                    !prefillPageCapacityBlocked) {
+                    !prefillPageCapacityBlocked && !forceDecodeThisIteration) {
                     continue;
                 }
 
@@ -22538,10 +22574,14 @@ namespace fastllm {
                     if (ctx == nullptr || ctx->isEnding) {
                         continue;
                     }
-                    if (isPrompt && ctx->preTokens != 0) {
+                    auto role = ClassifyRequest(ctx, longPrefillChunk);
+                    if (isPrompt && !role.isPromptEligible) {
                         continue;
                     }
-                    if (!isPrompt && ctx->preTokens == 0) {
+                    if (!isPrompt && !role.isDecodeActive) {
+                        continue;
+                    }
+                    if (isPrompt && !canAddPrefill && !role.inFlightPrefill) {
                         continue;
                     }
                     if (!isPrompt && !seqLens.empty() &&
@@ -22558,7 +22598,14 @@ namespace fastllm {
                     }
 
                     int scheduledTokens = isPrompt ?
-                        (int)ctx->currentTokens.size() : scheduledDecodeTokens(ctx);
+                        SelectPrefillChunkLen(
+                            ctx, longPrefillChunk, prefillChunkSize,
+                            (int)seqLens.size(), selectedPrefillTokens,
+                            batchedPrefillTokenLimit) :
+                        scheduledDecodeTokens(ctx);
+                    if (isPrompt && scheduledTokens <= 0) {
+                        continue;
+                    }
                     if (isPrompt && gpuTokenHandoffConfigured &&
                         !seqLens.empty() &&
                         (scheduledTokens > prefillChunkSize ||
@@ -22567,16 +22614,29 @@ namespace fastllm {
                         continue;
                     }
                     if ((maxTotalLens > 0 &&
-                         ctx->cacheLen + scheduledTokens > maxTotalLens) ||
-                        ctx->cacheLen + scheduledTokens > model->max_positions) {
+                         ctx->cacheLen + ctx->preTokens + scheduledTokens >
+                             maxTotalLens) ||
+                        ctx->cacheLen + ctx->preTokens + scheduledTokens >
+                            model->max_positions) {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         continue;
                     }
 
                     if (isPrompt) {
+                        if (PrefixRestoreAllowed(ctx) &&
+                            tryRestorePrefixCache(ctx) < 0) {
+                            releaseAndReinitRequest(ctx);
+                        }
+                        scheduledTokens = SelectPrefillChunkLen(
+                            ctx, longPrefillChunk, prefillChunkSize,
+                            (int)seqLens.size(), selectedPrefillTokens,
+                            batchedPrefillTokenLimit);
+                        if (scheduledTokens <= 0) {
+                            continue;
+                        }
                         int cachedAndScheduled =
-                            ctx->cacheLen + scheduledTokens;
+                            ctx->cacheLen + ctx->preTokens + scheduledTokens;
                         int remainingCapacity =
                             model->max_positions - cachedAndScheduled;
                         if (maxTotalLens > 0) {
@@ -22600,12 +22660,6 @@ namespace fastllm {
                             prefillPageCapacityBlocked = true;
                             continue;
                         }
-                        if (ctx->cacheLen == 0 &&
-                            tryRestorePrefixCache(ctx) < 0) {
-                            releaseAndReinitRequest(ctx);
-                        }
-                        scheduledTokens =
-                            (int)ctx->currentTokens.size();
                         // Prefix restore has already acquired its pages.
                         // Keep only still-unallocated needs for this batch.
                         accumulatePagedManagerNeeds(selectedPrefillPageNeeds,
@@ -22643,6 +22697,9 @@ namespace fastllm {
                     selectedMultimodal = isMultimodal;
                     if (isPrompt) {
                         selectedPrefillTokens += scheduledTokens;
+                        if (longPrefillChunk) {
+                            ArmChunkedPrefill(ctx, prefillChunkSize);
+                        }
                     }
 
                     if (!isPrompt && !ctx->currentTokens.empty()) {
@@ -22702,20 +22759,27 @@ namespace fastllm {
                             ctx->preTokens += seqLen;
                         }
                     } else {
-                        if (ctx->preTokens == 0) {
-                            ctx->intParams["add_special_tokens"] =
-                                ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                        const bool stillPrefilling = longPrefillChunk &&
+                            (ctx->prefillRemaining > 0 || isPrompt);
+                        const int fillLen = isPrompt ? scheduledTokens :
+                            (int)ctx->currentTokens.size();
+                        if (stillPrefilling || ctx->preTokens == 0) {
+                            if (ctx->preTokens == 0) {
+                                ctx->intParams["add_special_tokens"] =
+                                    ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                                ctx->intParams["index"] = 0;
+                            }
                             ctx->intParams["promptLen"] =
-                                ctx->cacheLen + (int)ctx->currentTokens.size();
-                            ctx->intParams["index"] = 0;
+                                ctx->cacheLen + ctx->preTokens + fillLen;
                         } else {
                             ctx->intParams["index"]++;
                         }
                         Data inputIds, attentionMask, curPositionIds;
                         std::vector<std::vector<float> > tokens(1);
-                        tokens[0].reserve(ctx->currentTokens.size());
-                        for (int token : ctx->currentTokens) {
-                            tokens[0].push_back((float)token);
+                        const int copyLen = std::min(fillLen, (int)ctx->currentTokens.size());
+                        tokens[0].reserve(copyLen);
+                        for (int i = 0; i < copyLen; i++) {
+                            tokens[0].push_back((float)ctx->currentTokens[i]);
                         }
                         model->FillLLMInputs(tokens, ctx->intParams,
                                              inputIds, attentionMask, curPositionIds);
@@ -22760,6 +22824,17 @@ namespace fastllm {
                 }
             }
 
+            if (!seqLens.empty()) {
+                if (selectedIsPrompt) {
+                    activePrefillNeedsDecode = ShouldArmPrefillYield(
+                        activeBeforeSelection,
+                        (int)handles.size(),
+                        (int)orders.size());
+                } else {
+                    activePrefillNeedsDecode = false;
+                }
+            }
+
             if (selectedNeedLastTokens) {
                 tokensManager.units.reserve(tokenContexts.size());
                 for (auto *ctx : tokenContexts) {
@@ -22771,6 +22846,30 @@ namespace fastllm {
                 ResponseContext *singleContext = tokenContexts.empty() ? nullptr : tokenContexts[0];
                 dictLocker.unlock();
                 forwardLocker.lock();
+
+                bool skipIntermediateHead = false;
+                if (longPrefillChunk && selectedIsPrompt && !selectedMultimodal) {
+                    skipIntermediateHead = !tokenContexts.empty();
+                    for (int i = 0; i < (int)tokenContexts.size(); i++) {
+                        if (!generationConfigs[i].IsSimpleGreedy() ||
+                            tokenContexts[i]->prefillRemaining <= seqLens[i]) {
+                            skipIntermediateHead = false;
+                            break;
+                        }
+                    }
+                }
+                struct IntermediatePrefillGuard {
+                    basellm *model;
+                    bool previous;
+                    IntermediatePrefillGuard(basellm *m, bool enable)
+                        : model(m), previous(m->isIntermediateChunkedPrefill) {
+                        m->isIntermediateChunkedPrefill = enable;
+                    }
+                    ~IntermediatePrefillGuard() {
+                        model->isIntermediateChunkedPrefill = previous;
+                    }
+                };
+                IntermediatePrefillGuard skipHeadGuard(model, skipIntermediateHead);
 
                 Data inputIds(DataType::FLOAT32, {1, (int)ids.size()}, ids);
                 Data multimodalAdjustedPositionIds;
@@ -23521,6 +23620,10 @@ namespace fastllm {
                         if (contextIt == model->responseContextDict.dicts.end()) {
                             continue;
                         }
+                        if (longPrefillChunk &&
+                            contextIt->second->prefillRemaining > seqLens[i]) {
+                            continue;
+                        }
                         if (i < (int)seqLens.size() && seqLens[i] > 1 &&
                             (int)contextIt->second->allTokens.size() >= pageLen) {
                             contextIt->second->TryRecordPagedCache(model);
@@ -23558,6 +23661,13 @@ namespace fastllm {
                     if (i < (int)keptInputLens.size() && i < (int)seqLens.size() &&
                         keptInputLens[i] >= 0 && keptInputLens[i] < seqLens[i]) {
                         ctx->preTokens -= seqLens[i] - keptInputLens[i];
+                    }
+                    const int fed = i < (int)keptInputLens.size() &&
+                        keptInputLens[i] >= 0 ?
+                        keptInputLens[i] : seqLens[i];
+                    if (longPrefillChunk &&
+                        CommitIntermediatePrefillChunk(ctx, fed)) {
+                        continue;
                     }
 
                     static const std::vector<int> emptyAcceptedTokens;
