@@ -18,10 +18,14 @@
 
 namespace {
 
-constexpr size_t kSmallBytes = 16 * 1024;
+constexpr size_t kSmallBytes = 10 * 1024;
 constexpr size_t kLargeBytes = 1024 * 1024;
 constexpr size_t kDecodeB8Bytes = 80 * 1024;
-constexpr size_t kCaptureMissBytes = 40 * 1024;
+constexpr size_t kCaptureMissBytes = 10 * 1024;
+constexpr size_t kNcclFloorBytes = 40 * 1024;
+constexpr size_t kSizeSweepBytes[] = {
+    10 * 1024, 20 * 1024, 40 * 1024, 80 * 1024
+};
 constexpr int kGraphCollectivesPerReplay = 32;
 constexpr int kGraphReplayIterations = 16;
 
@@ -239,6 +243,27 @@ bool RunKernelRegression(const std::vector<int> &devices, int count,
         ok = ok && CopyAndCheck(
             devices, inputs, expected, count,
             std::string(typeName) + " in-place all-reduce");
+    }
+
+    if (ok && !CopyInputs(devices, inputs, hostInputs, count)) {
+        ok = false;
+    }
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return FastllmCudaCustomAllReduce(
+                inputs[rank], outputs[rank], count, dataType, devices[rank]) &&
+                   FastllmCudaCustomAllReduce(
+                       outputs[rank], inputs[rank], count, dataType,
+                       devices[rank]);
+        });
+        std::vector<T> pingExpected(count);
+        for (int index = 0; index < count; ++index) {
+            pingExpected[index] = HostFromFloat<T>(
+                HostToFloat(expected[index]) * (float)ranks);
+        }
+        ok = ok && CopyAndCheck(
+            devices, inputs, pingExpected, count,
+            std::string(typeName) + " ping-pong skip-end all-reduce");
     }
 
     if (ok && ranks == 2) {
@@ -531,6 +556,117 @@ bool RunGraphInPlaceOrderingRegression(const std::vector<int> &devices,
     return ok;
 }
 
+template <typename T>
+bool RunGraphPingPongOrderingRegression(
+        const std::vector<int> &devices, int dataType,
+        const char *typeName, bool &tested) {
+    tested = false;
+    const int ranks = (int)devices.size();
+    const int count = (int)(kSmallBytes / sizeof(T));
+    if (!FastllmCudaCustomAllReduceCanRun(count, dataType, devices[0])) {
+        return true;
+    }
+    tested = true;
+
+    std::vector<void *> inputs(ranks, nullptr);
+    std::vector<void *> outputs(ranks, nullptr);
+    std::vector<std::vector<T> > hostInputs(ranks);
+    std::vector<cudaGraphExec_t> graphExecs(ranks, nullptr);
+    bool ok = true;
+    for (int rank = 0; rank < ranks; ++rank) {
+        hostInputs[rank].assign(
+            count, HostFromFloat<T>((float)(rank + 1) * 1.0e-3f));
+        ok = ok && CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+             CheckCuda(cudaMalloc(&inputs[rank], sizeof(T) * count),
+                       "cudaMalloc(graph ping-pong input)") &&
+             CheckCuda(cudaMalloc(&outputs[rank], sizeof(T) * count),
+                       "cudaMalloc(graph ping-pong output)");
+    }
+    if (ok) {
+        ok = CopyInputs(devices, inputs, hostInputs, count);
+    }
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return FastllmCudaCustomAllReduce(
+                       inputs[rank], outputs[rank], count, dataType,
+                       devices[rank]) &&
+                   FastllmCudaCustomAllReduce(
+                       outputs[rank], inputs[rank], count, dataType,
+                       devices[rank]);
+        });
+    }
+    if (ok) {
+        ok = CopyInputs(devices, inputs, hostInputs, count);
+    }
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            cudaGraph_t graph = nullptr;
+            bool localOk = CheckCuda(cudaStreamBeginCapture(
+                cudaStreamPerThread, cudaStreamCaptureModeRelaxed),
+                "cudaStreamBeginCapture(ping-pong)") &&
+                FastllmCudaCustomAllReduce(
+                    inputs[rank], outputs[rank], count, dataType,
+                    devices[rank]) &&
+                FastllmCudaCustomAllReduce(
+                    outputs[rank], inputs[rank], count, dataType,
+                    devices[rank]) &&
+                CheckCuda(cudaStreamEndCapture(cudaStreamPerThread, &graph),
+                          "cudaStreamEndCapture(ping-pong)") &&
+                graph != nullptr;
+            if (localOk) {
+                localOk = CheckCuda(cudaGraphInstantiate(
+                    &graphExecs[rank], graph, 0),
+                    "cudaGraphInstantiate(ping-pong)");
+            }
+            if (graph != nullptr) {
+                cudaGraphDestroy(graph);
+            }
+            return localOk;
+        });
+    }
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            if (rank == 1) {
+                for (int spin = 0; spin < 4096; ++spin) {
+                    std::this_thread::yield();
+                }
+            }
+            for (int iteration = 0;
+                 iteration < kGraphReplayIterations; ++iteration) {
+                if (!CheckCuda(cudaGraphLaunch(
+                        graphExecs[rank], cudaStreamPerThread),
+                        "cudaGraphLaunch(ping-pong)")) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+    T expectedValue = HostFromFloat<T>(0.0f);
+    for (int rank = 0; rank < ranks; ++rank) {
+        expectedValue = HostAddRounded(expectedValue, hostInputs[rank][0]);
+    }
+    expectedValue = HostFromFloat<T>(
+        HostToFloat(expectedValue) * (float)ranks);
+    for (int iteration = 1; iteration < kGraphReplayIterations; ++iteration) {
+        expectedValue = HostFromFloat<T>(
+            HostToFloat(expectedValue) * (float)ranks * (float)ranks);
+    }
+    if (ok) {
+        ok = CopyAndCheck(
+            devices, inputs, std::vector<T>(count, expectedValue), count,
+            std::string(typeName) + " CUDA Graph ping-pong skip-end");
+    }
+    for (int rank = 0; rank < ranks; ++rank) {
+        if (graphExecs[rank] != nullptr) {
+            cudaSetDevice(devices[rank]);
+            cudaGraphExecDestroy(graphExecs[rank]);
+        }
+    }
+    FreeBuffers(devices, inputs, outputs);
+    return ok;
+}
+
 bool CaptureAllReduceGraph(void *input, void *output, int count,
                            int dataType, int device,
                            cudaGraphExec_t &graphExec) {
@@ -678,6 +814,203 @@ bool RunAllSelectedPaths(const std::vector<int> &devices,
                selectedPaths, testedPaths);
 }
 
+bool CaptureAndReplayAllReduce(
+        const std::vector<int> &devices, const std::vector<void *> &buffers,
+        int count, int dataType, bool custom, int iterations,
+        float &averageUs) {
+    const int ranks = (int)devices.size();
+    std::vector<cudaGraphExec_t> graphExecs(ranks, nullptr);
+    std::vector<float> elapsedMs(ranks, 0.0f);
+    bool ok = true;
+    if (custom) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            return FastllmCudaCustomAllReduce(
+                buffers[rank], buffers[rank], count,
+                dataType, devices[rank]);
+        });
+    }
+    if (!ok) {
+        return false;
+    }
+    ok = RunOnRanks(devices, [&](int rank) {
+        cudaGraph_t graph = nullptr;
+        bool localOk = CheckCuda(cudaStreamBeginCapture(
+            cudaStreamPerThread, cudaStreamCaptureModeRelaxed),
+            "cudaStreamBeginCapture(size-sweep)") &&
+            (custom
+                 ? FastllmCudaCustomAllReduce(
+                       buffers[rank], buffers[rank], count,
+                       dataType, devices[rank])
+                 : (FastllmNcclAllReduceNoCustom(
+                        buffers[rank], buffers[rank], count,
+                        dataType, devices[rank]),
+                    !FastllmCudaGetThreadError())) &&
+            CheckCuda(cudaStreamEndCapture(cudaStreamPerThread, &graph),
+                      "cudaStreamEndCapture(size-sweep)") &&
+            graph != nullptr;
+        if (localOk) {
+            localOk = CheckCuda(cudaGraphInstantiate(
+                &graphExecs[rank], graph, 0),
+                "cudaGraphInstantiate(size-sweep)");
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+        return localOk;
+    });
+    if (ok) {
+        ok = RunOnRanks(devices, [&](int rank) {
+            cudaEvent_t begin = nullptr;
+            cudaEvent_t end = nullptr;
+            bool localOk = CheckCuda(cudaEventCreate(&begin),
+                                     "cudaEventCreate(size-sweep begin)") &&
+                CheckCuda(cudaEventCreate(&end),
+                          "cudaEventCreate(size-sweep end)") &&
+                CheckCuda(cudaEventRecord(begin, cudaStreamPerThread),
+                          "cudaEventRecord(size-sweep begin)");
+            for (int iteration = 0; iteration < iterations && localOk;
+                 ++iteration) {
+                localOk = CheckCuda(cudaGraphLaunch(
+                    graphExecs[rank], cudaStreamPerThread),
+                    "cudaGraphLaunch(size-sweep)");
+            }
+            localOk = localOk && CheckCuda(cudaEventRecord(
+                end, cudaStreamPerThread),
+                "cudaEventRecord(size-sweep end)") &&
+                CheckCuda(cudaEventSynchronize(end),
+                          "cudaEventSynchronize(size-sweep)") &&
+                CheckCuda(cudaEventElapsedTime(
+                    &elapsedMs[rank], begin, end),
+                    "cudaEventElapsedTime(size-sweep)");
+            if (begin != nullptr) {
+                cudaEventDestroy(begin);
+            }
+            if (end != nullptr) {
+                cudaEventDestroy(end);
+            }
+            return localOk;
+        });
+    }
+    averageUs = *std::max_element(elapsedMs.begin(), elapsedMs.end()) *
+                1000.0f / (float)iterations;
+    for (int rank = 0; rank < ranks; ++rank) {
+        if (graphExecs[rank] != nullptr) {
+            cudaSetDevice(devices[rank]);
+            cudaGraphExecDestroy(graphExecs[rank]);
+        }
+    }
+    return ok;
+}
+
+bool RunTp4SizePolicyAndNcclGraphRegression(
+        const std::vector<int> &devices, bool autoMode, bool customEnabled) {
+    if (devices.size() != 4) {
+        return true;
+    }
+    const int dataType = (int)fastllm::DataType::FLOAT16;
+    for (size_t bytes : kSizeSweepBytes) {
+        const int count = (int)(bytes / sizeof(half));
+        const bool canRun = FastllmCudaCustomAllReduceCanRun(
+            count, dataType, devices[0]);
+        // Auto mode: the 10 KiB probe may or may not enable the small path,
+        // but 40 KiB and above must stay on NCCL. Force mode keeps custom
+        // at every supported size, including 40 KiB.
+        if (autoMode) {
+            if (bytes >= kNcclFloorBytes && canRun) {
+                std::cerr << "TP4 auto mode must keep NCCL at "
+                          << (bytes / 1024) << " KiB, but custom can_run=1\n";
+                return false;
+            }
+        } else if (canRun != customEnabled) {
+            std::cerr << "TP4 custom all-reduce policy mismatch at "
+                      << (bytes / 1024) << " KiB: expected can_run="
+                      << customEnabled << ", got " << canRun
+                      << " (auto=" << autoMode
+                      << ", enabled=" << customEnabled << ")\n";
+            return false;
+        }
+    }
+
+    constexpr int kNcclGraphReplays = 512;
+    const int count = (int)(kNcclFloorBytes / sizeof(half));
+    std::vector<void *> buffers(4, nullptr);
+    bool ok = true;
+    for (int rank = 0; rank < 4 && ok; ++rank) {
+        ok = CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+             CheckCuda(cudaMalloc(&buffers[rank], kNcclFloorBytes),
+                       "cudaMalloc(TP4 NCCL graph)");
+    }
+    float ncclUs = 0.0f;
+    if (ok) {
+        ok = CaptureAndReplayAllReduce(
+            devices, buffers, count, dataType, false, kNcclGraphReplays,
+            ncclUs);
+    }
+    std::vector<void *> unused(4, nullptr);
+    FreeBuffers(devices, buffers, unused);
+    if (!ok) {
+        std::cerr << "TP4 CUDA Graph NCCL 40 KiB replay failed.\n";
+        return false;
+    }
+    std::cout << "TP4 CUDA Graph NCCL 40 KiB: " << ncclUs
+              << " us/collective over " << kNcclGraphReplays
+              << " replays\n";
+    return true;
+}
+
+bool RunTp4InGraphSizeSweep(const std::vector<int> &devices) {
+    if (devices.size() != 4) {
+        return true;
+    }
+    const int dataType = (int)fastllm::DataType::FLOAT16;
+    constexpr int kSweepReplays = 50;
+    constexpr float kRequiredRatio = 0.97f;
+    for (size_t bytes : kSizeSweepBytes) {
+        const int count = (int)(bytes / sizeof(half));
+        const bool canRun = FastllmCudaCustomAllReduceCanRun(
+            count, dataType, devices[0]);
+        std::vector<void *> buffers(4, nullptr);
+        bool ok = true;
+        for (int rank = 0; rank < 4 && ok; ++rank) {
+            ok = CheckCuda(cudaSetDevice(devices[rank]), "cudaSetDevice") &&
+                 CheckCuda(cudaMalloc(&buffers[rank], bytes),
+                           "cudaMalloc(size-sweep)");
+        }
+        float ncclUs = 0.0f;
+        float customUs = 0.0f;
+        if (ok) {
+            ok = CaptureAndReplayAllReduce(
+                devices, buffers, count, dataType, false, kSweepReplays,
+                ncclUs);
+        }
+        if (ok && canRun) {
+            ok = CaptureAndReplayAllReduce(
+                devices, buffers, count, dataType, true, kSweepReplays,
+                customUs);
+        }
+        std::vector<void *> unused(4, nullptr);
+        FreeBuffers(devices, buffers, unused);
+        if (!ok) {
+            std::cerr << "TP4 in-graph size sweep failed at "
+                      << (bytes / 1024) << " KiB.\n";
+            return false;
+        }
+        if (canRun) {
+            const bool customWins = customUs <= ncclUs * kRequiredRatio;
+            std::cout << "TP4 in-graph FP16 " << (bytes / 1024)
+                      << " KiB: custom " << customUs << " us, NCCL "
+                      << ncclUs << " us -> "
+                      << (customWins ? "custom would win" : "NCCL would win")
+                      << " (3% gate)\n";
+        } else {
+            std::cout << "TP4 in-graph FP16 " << (bytes / 1024)
+                      << " KiB: custom disabled, NCCL " << ncclUs
+                      << " us\n";
+        }
+    }
+    return true;
+}
+
 bool HasFullMeshP2P(const std::vector<int> &devices, bool &queryOk) {
     queryOk = true;
     for (int device : devices) {
@@ -779,9 +1112,19 @@ int main() {
     if (!RunAllSelectedPaths(devices, selectedPaths, testedPaths)) {
         return 1;
     }
+    const char *customArEnv = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
+    const bool autoMode = customArEnv == nullptr ||
+        std::string(customArEnv) == "" ||
+        std::string(customArEnv) == "auto";
+    if (!RunTp4SizePolicyAndNcclGraphRegression(
+            devices, autoMode, actualEnabled) ||
+        !RunTp4InGraphSizeSweep(devices)) {
+        return 1;
+    }
     float fp16B8GraphFusedUs = 0.0f;
     float bf16B8GraphFusedUs = 0.0f;
     bool graphInPlaceOrderingTested = false;
+    bool graphPingPongOrderingTested = false;
     if (!RunGraphFusedRegression<half>(
             devices, (int)fastllm::DataType::FLOAT16, "FP16",
             fp16B8GraphFusedUs) ||
@@ -790,7 +1133,10 @@ int main() {
             bf16B8GraphFusedUs) ||
         !RunGraphInPlaceOrderingRegression<half>(
             devices, (int)fastllm::DataType::FLOAT16, "FP16",
-            graphInPlaceOrderingTested)) {
+            graphInPlaceOrderingTested) ||
+        !RunGraphPingPongOrderingRegression<half>(
+            devices, (int)fastllm::DataType::FLOAT16, "FP16",
+            graphPingPongOrderingTested)) {
         return 1;
     }
     if (actualEnabled && selectedPaths == 0) {
@@ -878,6 +1224,8 @@ int main() {
               << graphCaptureMissFallbackTested
               << ", graph_inplace_ordering="
               << graphInPlaceOrderingTested
+              << ", graph_pingpong_ordering="
+              << graphPingPongOrderingTested
               << ", reset_reinit=1, switched_group="
               << switchedGroupTested << ")\n";
     return 0;

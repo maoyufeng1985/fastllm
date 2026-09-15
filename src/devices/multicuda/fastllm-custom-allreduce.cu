@@ -35,9 +35,15 @@ constexpr int kCustomArMaxBlocks = 36;
 constexpr int kCustomArThreads = 512;
 constexpr int kCustomArPushMaxBlocks = 256;
 constexpr size_t kCustomArPushMaxBytes = 1ULL * 1024ULL * 1024ULL;
-constexpr size_t kCustomArAutoSmallBytes = 16ULL * 1024ULL;
+// Decode AR on Qwen3.8 TP4 is hidden 5120 x 2 B = 10 KiB. Probe that size
+// instead of 16 KiB so a decode loss cannot be masked by a nearby tie.
+constexpr size_t kCustomArAutoSmallBytes = 10ULL * 1024ULL;
 constexpr size_t kCustomArAutoLargeBytes = 1ULL * 1024ULL * 1024ULL;
 constexpr size_t kCustomArAutoTp2LargeBoundary = 256ULL * 1024ULL;
+// On TP>=4 this box's one-stage custom path loses to NCCL from 40 KiB up
+// (and the two-stage switch is only at 512 KiB). Auto mode therefore keeps
+// every >=40 KiB tensor on NCCL even if the 10 KiB probe enabled "small".
+constexpr size_t kCustomArAutoNcclMinBytes = 40ULL * 1024ULL;
 constexpr float kCustomArAutoRequiredRatio = 0.97f;
 constexpr uint32_t kCustomArFp16SmallPath = 1U << 0;
 constexpr uint32_t kCustomArFp16LargePath = 1U << 1;
@@ -303,7 +309,8 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
                                   CustomArSignal *selfSignal,
                                   T *__restrict__ output,
                                   int rank, int packedCount,
-                                  bool writeAfterBarrier) {
+                                  bool writeAfterBarrier,
+                                  bool skipEndBarrier) {
     using P = typename CustomArPacked<T>::P;
     using A = typename CustomArPacked<T>::A;
     CustomArRankData pointers = *rankData;
@@ -341,7 +348,13 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
             reinterpret_cast<P *>(output)[index] = result;
         }
     }
-    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    // Independent dest is not an input. The next collective's start barrier
+    // (or a host sync) is the completion handshake, so the end barrier is
+    // only required when this kernel may overwrite a buffer a peer still
+    // reads. writeAfterBarrier already implies an in-place dest.
+    if (!skipEndBarrier) {
+        CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    }
     if (writeAfterBarrier) {
         // All signal lanes must finish the cross-GPU final barrier before any
         // rank overwrites its input.  This replaces the old scratch write plus
@@ -886,6 +899,7 @@ struct CustomArState {
     bool pushAvailable = false;
     bool pushUsePdl = false;
     bool captureFallbackLogged = false;
+    bool autoModePublished = false;
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
     uint64_t generation = 0;
@@ -999,9 +1013,18 @@ uint32_t CustomArPathFor(size_t ranks, size_t bytes, int dataType) {
     return fp16Path;
 }
 
+bool CustomArAutoNcclBySize(const CustomArState &state, size_t bytes) {
+    return state.autoModePublished &&
+           state.devices.size() > 2 &&
+           bytes >= kCustomArAutoNcclMinBytes;
+}
+
 bool CustomArPathEnabled(const CustomArState &state, size_t bytes,
                          int dataType) {
     if (!state.runtimeEnabled.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (CustomArAutoNcclBySize(state, bytes)) {
         return false;
     }
     uint32_t enabled = state.enabledPaths.load(std::memory_order_acquire);
@@ -1214,7 +1237,8 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
 
 template <typename T>
 bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
-                    T *output, int rank, int count, bool writeAfterBarrier) {
+                    T *output, int rank, int count, bool writeAfterBarrier,
+                    bool skipEndBarrier) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
@@ -1243,7 +1267,7 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
                 <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], output, rank,            \
-                    packedCount, writeAfterBarrier);                         \
+                    packedCount, writeAfterBarrier, skipEndBarrier);         \
         }                                                                    \
         break
     switch (state.devices.size()) {
@@ -1464,19 +1488,23 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     // the inputs; larger messages retain the established scratch copy-back.
     void *kernelDest = data == dest && !useTwoStage && !fusedCopyBack
         ? state.inplaceScratch[rank] : dest;
+    // Distinct dest is never an input, so the end barrier is redundant. The
+    // caller must not overwrite any rank's input until the next start barrier
+    // or a host sync. In-place still needs the end barrier.
+    const bool skipEndBarrier = data != dest && !useTwoStage;
     bool launched = false;
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<half *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, skipEndBarrier);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         launched = LaunchCustomAr(
             state, rankData, reinterpret_cast<__nv_bfloat16 *>(kernelDest),
-            rank, count, fusedCopyBack);
+            rank, count, fusedCopyBack, skipEndBarrier);
     } else if (dataType == fastllm::DataType::FLOAT32) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<float *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, skipEndBarrier);
     }
     if (!launched) {
         return false;
@@ -2221,6 +2249,7 @@ void FastllmCudaCustomAllReduceReset() {
         state.lastRegistrationOk = false;
         state.lastRegistrationMissDuringCapture = false;
         state.captureFallbackLogged = false;
+        state.autoModePublished = false;
         state.pendingInputs.clear();
         state.pendingCapturing.clear();
         state.lastRankData.clear();
@@ -2273,6 +2302,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     state.pushBlocks = 0;
     state.pushAvailable = false;
     state.pushUsePdl = false;
+    state.autoModePublished = false;
 
     int originalDevice = FastllmCudaGetDevice();
     bool ok = true;
@@ -2397,6 +2427,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     }
     FastllmCudaSetDevice(originalDevice);
     if (!ok) {
+        state.autoModePublished = false;
         state.enabledPaths.store(0, std::memory_order_release);
         state.runtimeEnabled.store(false, std::memory_order_release);
         std::vector<int> failedDevices = state.devices;
@@ -2434,10 +2465,12 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
             state.ncclGeneration == ncclGeneration &&
             ncclGeneration == FastllmGetNcclGeneration();
         if (valid) {
+            state.autoModePublished = autoMode;
             state.enabledPaths.store(enabledPaths, std::memory_order_release);
             state.runtimeEnabled.store(enabledPaths != 0,
                                        std::memory_order_release);
         } else {
+            state.autoModePublished = false;
             state.enabledPaths.store(0, std::memory_order_release);
             state.runtimeEnabled.store(false, std::memory_order_release);
         }
@@ -2480,6 +2513,12 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
                      "[Fastllm] custom all-reduce auto-enabled for %zu GPUs "
                      "(%d of 6 dtype/message paths).\n",
                      devices.size(), selectedPathCount);
+        if (devices.size() > 2) {
+            std::fprintf(stderr,
+                         "[Fastllm] custom all-reduce auto mode keeps NCCL "
+                         "for TP>=4 messages of %zu KiB and above.\n",
+                         (size_t)(kCustomArAutoNcclMinBytes / 1024ULL));
+        }
     }
     std::fflush(stderr);
     return enabled;

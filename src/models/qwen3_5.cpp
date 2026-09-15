@@ -3420,7 +3420,7 @@ namespace fastllm {
         }
 
         struct Qwen35ForwardSingleBuffers {
-            Data embedOutput, hiddenStates, attenInput;
+            Data embedOutput, hiddenStates, hiddenStatesReduceScratch, attenInput;
             Data merged, qgate, gate, q, k, v, attenOutput, attenLastOutput, qForAttentionHolder;
             Data kAppend, vAppend;
             Data gateupResult, swigluResult, mlpPart;
@@ -3472,7 +3472,8 @@ namespace fastllm {
             visitor(workspace.logits);
             visitor(workspace.linearSlotIds);
             const Qwen35ForwardSingleBuffers &buf = workspace.buffers;
-            visitor(buf.embedOutput); visitor(buf.hiddenStates); visitor(buf.attenInput);
+            visitor(buf.embedOutput); visitor(buf.hiddenStates);
+            visitor(buf.hiddenStatesReduceScratch); visitor(buf.attenInput);
             visitor(buf.merged); visitor(buf.qgate); visitor(buf.gate);
             visitor(buf.q); visitor(buf.k); visitor(buf.v);
             visitor(buf.attenOutput); visitor(buf.attenLastOutput);
@@ -5590,7 +5591,8 @@ namespace fastllm {
                 bool sharedGateAlreadySigmoid,
                 bool tensorParallel,
                 bool firstTensorParallelRank,
-                int gpuId) {
+                int gpuId,
+                qwen3cuda::Qwen3CudaTpReducePingPong *tpReducePing = nullptr) {
             const int count = hiddenStates.Count(0);
             if (tensorParallel &&
                 FastllmCanUseTP2P2PAllReduceAdd(
@@ -5617,9 +5619,8 @@ namespace fastllm {
                     Qwen35CudaCopyTensor(
                         runner, routedOutput, hiddenStates);
                 }
-                FastllmNcclAllReduce(
-                    hiddenStates.cudaData, hiddenStates.cudaData,
-                    count, hiddenStates.dataType, gpuId);
+                qwen3cuda::Qwen3CudaTpAllReduce(
+                    hiddenStates, gpuId, tpReducePing);
                 return true;
             }
 
@@ -5632,9 +5633,8 @@ namespace fastllm {
                 return false;
             }
             if (tensorParallel) {
-                FastllmNcclAllReduce(
-                    hiddenStates.cudaData, hiddenStates.cudaData,
-                    count, hiddenStates.dataType, gpuId);
+                qwen3cuda::Qwen3CudaTpAllReduce(
+                    hiddenStates, gpuId, tpReducePing);
             }
             return true;
         }
@@ -11266,6 +11266,11 @@ namespace fastllm {
                 Qwen3CudaToDataType(cudaRunner, buf.hiddenStates, computeType);
             }
 
+            qwen3cuda::Qwen3CudaTpReducePingPong tpReducePing;
+            if (tensorParallel) {
+                tpReducePing.Bind(buf.hiddenStates, buf.hiddenStatesReduceScratch);
+            }
+
             auto addPartialToResidualReduce = [&](Data &partial) {
                 if (partial.dataType != buf.hiddenStates.dataType) {
                     Qwen3CudaToDataType(cudaRunner, partial, buf.hiddenStates.dataType);
@@ -11279,11 +11284,8 @@ namespace fastllm {
                             Qwen35CudaCopyTensor(
                                 cudaRunner, partial, buf.hiddenStates);
                         }
-                        FastllmNcclAllReduce(
-                            buf.hiddenStates.cudaData,
-                            buf.hiddenStates.cudaData,
-                            buf.hiddenStates.Count(0),
-                            buf.hiddenStates.dataType, gpuId);
+                        Qwen3CudaTpAllReduce(
+                            buf.hiddenStates, gpuId, &tpReducePing);
                     }
                 } else {
                     Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
@@ -11387,7 +11389,7 @@ namespace fastllm {
                             *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                             buf.attenLastOutput, buf.hiddenStates,
                             tensorParallel, firstTensorParallelRank, gpuId,
-                            true);
+                            true, false, &tpReducePing);
                     } else {
                         Qwen35ZeroCudaLike(buf.attenLastOutput, buf.hiddenStates, gpuId);
                         addPartialToResidualReduce(buf.attenLastOutput);
@@ -11700,7 +11702,8 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         buf.attenLastOutput, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        tensorParallel, firstTensorParallelRank, gpuId, true,
+                        false, &tpReducePing);
                 }
 
                 bool hasMergedDenseMlp =
@@ -11727,7 +11730,7 @@ namespace fastllm {
                             buf.gateupResult, buf.mlpPart,
                             buf.hiddenStates, tensorParallel,
                             firstTensorParallelRank, gpuId,
-                            &postRmsWeight, rms_norm_eps)) {
+                            &postRmsWeight, rms_norm_eps, &tpReducePing)) {
                         continue;
                     }
                 }
@@ -11747,7 +11750,8 @@ namespace fastllm {
                             downWeight, downBias,
                             buf.gateupResult, buf.mlpPart,
                             buf.hiddenStates, tensorParallel,
-                            firstTensorParallelRank, gpuId);
+                            firstTensorParallelRank, gpuId,
+                            nullptr, 0.0f, &tpReducePing);
                     if (!fusedTpMlp &&
                         !Qwen3CudaTrySwigluLinearResidualReduce(
                             cudaRunner, buf.attenInput,
@@ -11770,7 +11774,7 @@ namespace fastllm {
                             downWeight, downBias,
                             buf.mlpPart, buf.hiddenStates,
                             tensorParallel, firstTensorParallelRank, gpuId,
-                            true);
+                            true, false, &tpReducePing);
                     }
                     continue;
                 }
@@ -11820,7 +11824,8 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(downBiasName),
                                       downBiasName),
                         buf.mlpPart, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        tensorParallel, firstTensorParallelRank, gpuId, true,
+                        false, &tpReducePing);
                     continue;
                 }
 
@@ -11966,7 +11971,8 @@ namespace fastllm {
                             buf.sharedOutput,
                             sharedGatePending ? &buf.sharedGate : nullptr,
                             sharedGateAlreadySigmoid,
-                            tensorParallel, firstTensorParallelRank, gpuId)) {
+                            tensorParallel, firstTensorParallelRank, gpuId,
+                            &tpReducePing)) {
                         continue;
                     }
                     if (sharedGatePending) {
@@ -12599,6 +12605,11 @@ namespace fastllm {
         }
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
+        Data hiddenStatesReduceScratch;
+        qwen3cuda::Qwen3CudaTpReducePingPong tpReducePing;
+        if (tensorParallel) {
+            tpReducePing.Bind(hiddenStates, hiddenStatesReduceScratch);
+        }
         auto addPartialToResidualReduce = [&](Data &partial) {
             if (partial.dataType != hiddenStates.dataType) {
                 Qwen3CudaToDataType(cudaRunner, partial, hiddenStates.dataType);
@@ -12612,9 +12623,8 @@ namespace fastllm {
                         Qwen35CudaCopyTensor(
                             cudaRunner, partial, hiddenStates);
                     }
-                    FastllmNcclAllReduce(
-                        hiddenStates.cudaData, hiddenStates.cudaData,
-                        hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                    Qwen3CudaTpAllReduce(
+                        hiddenStates, gpuId, &tpReducePing);
                 }
             } else {
                 Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
@@ -12993,7 +13003,7 @@ namespace fastllm {
                                 oBiasName),
                             attenLastOutput, hiddenStates,
                             tensorParallel, firstTensorParallelRank,
-                            gpuId, true);
+                            gpuId, true, false, &tpReducePing);
                     } else {
                         Qwen35CudaAttentionPagedBlock(
                             cudaRunner,
@@ -13036,7 +13046,8 @@ namespace fastllm {
                             *requireLocal(weight[oWeightName], oWeightName),
                             *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                             attenLastOutput, hiddenStates,
-                            tensorParallel, firstTensorParallelRank, gpuId, true);
+                            tensorParallel, firstTensorParallelRank, gpuId, true,
+                            false, &tpReducePing);
                     }
                 } else {
                     Qwen35ZeroCudaLike(attenLastOutput, hiddenStates, gpuId);
@@ -14641,7 +14652,7 @@ namespace fastllm {
                             attenLastOutput, hiddenStates,
                             tensorParallel,
                             firstTensorParallelRank,
-                            gpuId);
+                            gpuId, &tpReducePing);
                 }
 #endif
                 if (!fusedGdnOutputProjection) {
@@ -14762,7 +14773,8 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         attenLastOutput, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        tensorParallel, firstTensorParallelRank, gpuId, true,
+                        false, &tpReducePing);
                 }
             }
             bool hasMergedDenseMlp =
@@ -14789,7 +14801,7 @@ namespace fastllm {
                         gateupResult, mlpPart,
                         hiddenStates, tensorParallel,
                         firstTensorParallelRank, gpuId,
-                        &postRmsWeight, rms_norm_eps)) {
+                        &postRmsWeight, rms_norm_eps, &tpReducePing)) {
                     captureDFlashHidden(i);
                     continue;
                 }
@@ -14810,7 +14822,8 @@ namespace fastllm {
                         downWeight, downBias,
                         gateupResult, mlpPart,
                         hiddenStates, tensorParallel,
-                        firstTensorParallelRank, gpuId);
+                        firstTensorParallelRank, gpuId,
+                        nullptr, 0.0f, &tpReducePing);
                 if (!fusedTpMlp &&
                     !Qwen3CudaTrySwigluLinearResidualReduce(
                         cudaRunner, attenInput,
@@ -14831,7 +14844,8 @@ namespace fastllm {
                         cudaRunner, swigluResult,
                         downWeight, downBias,
                         mlpPart, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        tensorParallel, firstTensorParallelRank, gpuId, true,
+                        false, &tpReducePing);
                 }
                 captureDFlashHidden(i);
                 continue;
@@ -14881,7 +14895,8 @@ namespace fastllm {
                     *requireLocal(GetThreadTensorParallelBias(downBiasName),
                                   downBiasName),
                     mlpPart, hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId, true);
+                    tensorParallel, firstTensorParallelRank, gpuId, true,
+                    false, &tpReducePing);
                 captureDFlashHidden(i);
                 continue;
             }
@@ -15030,7 +15045,8 @@ namespace fastllm {
                         cudaRunner, hiddenStates, moeFinal, sharedOutput,
                         sharedGatePending ? &sharedGate : nullptr,
                         sharedGateAlreadySigmoid,
-                        tensorParallel, firstTensorParallelRank, gpuId)) {
+                        tensorParallel, firstTensorParallelRank, gpuId,
+                        &tpReducePing)) {
                     captureDFlashHidden(i);
                     continue;
                 }

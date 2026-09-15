@@ -108,6 +108,71 @@ namespace fastllm {
 
     namespace qwen3cuda {
 
+    // Decode TP all-reduce ping-pong. Independent dest lets the one-stage
+    // custom kernel skip the end barrier. The next collective's start
+    // barrier is the completion handshake. CUDA Graph captures the two
+    // pointer tuples on alternate launches, so replay stays legal.
+    struct Qwen3CudaTpReducePingPong {
+        Data *live = nullptr;
+        Data *alt = nullptr;
+
+        void Bind(Data &hidden, Data &scratch) {
+            live = &hidden;
+            alt = &scratch;
+        }
+
+        Data &Live() {
+            return *live;
+        }
+
+        void PrepareAlt(int device) {
+            AssertInFastLLM(live != nullptr && alt != nullptr,
+                            "Qwen3CudaTpReducePingPong is not bound.\n");
+            if (alt->cudaData != nullptr &&
+                alt->dataType == live->dataType &&
+                alt->dataDevice == DataDevice::CUDA &&
+                (alt->dataDeviceIds.empty() ||
+                 alt->dataDeviceIds[0] == device) &&
+                alt->Count(0) >= live->Count(0)) {
+                alt->Resize(live->dims);
+                return;
+            }
+            Qwen3CudaPrepareLocalOutput(*alt, device);
+            alt->dataType = live->dataType;
+            alt->UpdateUnitSize();
+            alt->dataDevice = DataDevice::CUDA;
+            alt->dataDeviceIds = {device};
+            alt->Resize(live->dims);
+            alt->Allocate(false);
+        }
+
+        void AllReduce(int gpuId) {
+            PrepareAlt(gpuId);
+            FastllmNcclAllReduce(live->cudaData, alt->cudaData,
+                                 live->Count(0), live->dataType, gpuId);
+            std::swap(live->cudaData, alt->cudaData);
+            std::swap(live->expansionSize, alt->expansionSize);
+            std::swap(live->expansionBytes, alt->expansionBytes);
+        }
+    };
+
+    inline void Qwen3CudaTpAllReduce(Data &tensor, int gpuId,
+                                    Qwen3CudaTpReducePingPong *ping,
+                                    bool forceNativeNccl = false) {
+        if (forceNativeNccl) {
+            FastllmNcclAllReduceNoCustom(
+                tensor.cudaData, tensor.cudaData,
+                tensor.Count(0), tensor.dataType, gpuId);
+            return;
+        }
+        if (ping != nullptr && ping->live == &tensor) {
+            ping->AllReduce(gpuId);
+            return;
+        }
+        FastllmNcclAllReduce(tensor.cudaData, tensor.cudaData,
+                             tensor.Count(0), tensor.dataType, gpuId);
+    }
+
     inline void Qwen3CudaRMSNorm(Qwen3CudaDirectRunner &runner,
                                  const Data &input, Data &weight,
                                  float eps, Data &output) {
@@ -510,7 +575,8 @@ namespace fastllm {
             Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
             int gpuId, Data *preRmsWeight = nullptr,
-            float preRmsEps = 0.0f) {
+            float preRmsEps = 0.0f,
+            Qwen3CudaTpReducePingPong *tpReducePing = nullptr) {
         if (!tensorParallel ||
             !Qwen3CudaCanUseSwigluLinearAdd(
                 input, gateUp, down, downBias, hiddenStates)) {
@@ -589,9 +655,7 @@ namespace fastllm {
                 hiddenStates.cudaData, middle.cudaData,
                 hiddenStates.GetBytes());
         }
-        FastllmNcclAllReduce(
-            hiddenStates.cudaData, hiddenStates.cudaData,
-            hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+        Qwen3CudaTpAllReduce(hiddenStates, gpuId, tpReducePing);
         return true;
     }
 
@@ -604,7 +668,8 @@ namespace fastllm {
             Data &weight, Data &bias,
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
-            int gpuId) {
+            int gpuId,
+            Qwen3CudaTpReducePingPong *tpReducePing = nullptr) {
         if (GetFastllmEnv().cudaGraph ||
             !GetFastllmEnv().cudaTriton ||
             !tensorParallel ||
@@ -692,10 +757,7 @@ namespace fastllm {
                 hiddenStates.cudaData, middle.cudaData,
                 hiddenStates.GetBytes());
         }
-        FastllmNcclAllReduce(
-            hiddenStates.cudaData, hiddenStates.cudaData,
-            hiddenStates.Count(0), hiddenStates.dataType,
-            gpuId);
+        Qwen3CudaTpAllReduce(hiddenStates, gpuId, tpReducePing);
         return true;
     }
 
@@ -892,7 +954,8 @@ namespace fastllm {
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
             int gpuId, bool enableTP2P2PAllReduce = false,
-            bool forceNativeNccl = false) {
+            bool forceNativeNccl = false,
+            Qwen3CudaTpReducePingPong *tpReducePing = nullptr) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
 
@@ -915,10 +978,7 @@ namespace fastllm {
             int k = weight.dims[0];
             if (FastllmCudaCutlassLinearFP8E4M3Block128Add(
                     input, weight, bias, hiddenStates, n, m, k)) {
-                FastllmNcclAllReduce(
-                    hiddenStates.cudaData, hiddenStates.cudaData,
-                    hiddenStates.Count(0), hiddenStates.dataType,
-                    gpuId);
+                Qwen3CudaTpAllReduce(hiddenStates, gpuId, tpReducePing);
                 return;
             }
         }
@@ -937,15 +997,8 @@ namespace fastllm {
                 Qwen3CudaLinear(runner, input, weight, bias, hiddenStates);
                 Qwen3CudaToDataType(runner, hiddenStates, residualType);
             }
-            if (forceNativeNccl) {
-                FastllmNcclAllReduceNoCustom(
-                    hiddenStates.cudaData, hiddenStates.cudaData,
-                    hiddenStates.Count(0), hiddenStates.dataType, gpuId);
-            } else {
-                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                     hiddenStates.Count(0), hiddenStates.dataType,
-                                     gpuId);
-            }
+            Qwen3CudaTpAllReduce(hiddenStates, gpuId, tpReducePing,
+                                 forceNativeNccl);
             return;
         }
 

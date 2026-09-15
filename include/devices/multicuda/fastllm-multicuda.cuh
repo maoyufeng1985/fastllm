@@ -30,10 +30,13 @@ bool FastllmCudaPeerAccessInit(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
 // barrier. With FASTLLM_CUDA_CUSTOM_ALLREDUCE unset or set to "auto", it is
 // correctness-tested and benchmarked against NCCL on the active eager or CUDA
-// Graph path. FP16/BF16/FP32 and small/large messages are selected independently
-// for supported 2/4/6/8-GPU groups. Set the variable to 1 to
-// force-enable every supported path, or 0 to force-disable it. Unsupported or
-// disabled tensors return false so NCCL remains the fallback.
+// Graph path. The small-message probe is the decode size (10 KiB). FP16/BF16/
+// FP32 and small/large messages are selected independently for supported
+// 2/4/6/8-GPU groups. Auto mode on TP>=4 additionally keeps NCCL for every
+// message of 40 KiB and above, even if the 10 KiB probe enabled the small
+// path. Set the variable to 1 to force-enable every supported path, or 0 to
+// force-disable it. Unsupported or disabled tensors return false so NCCL
+// remains the fallback.
 bool FastllmCudaCustomAllReduceEnabled();
 bool FastllmCudaCustomAllReduceCanRun(int count, int dataType, int deviceId);
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
