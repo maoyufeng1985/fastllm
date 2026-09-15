@@ -414,7 +414,14 @@ def _print_result(result: Dict[str, object]):
 
     print()
     print("Reproducibility")
-    _print_kv("Token stream sha256", result["token_hash"])
+    # The digest covers every generated token id, so two runs only compare equal
+    # when their per-request token counts match. Print the count on the same line
+    # as the digest: comparing digests across different token counts is the exact
+    # mistake that produced a phantom "sha drifted between binaries" report.
+    _print_kv("Token stream sha256", "%s (tokens/request: %s)" % (
+        result["token_hash"],
+        ",".join(str(len(item.get("token_ids", [])))
+                 for item in result["requests"])))
 
     early_finished = [
         item for item in result["requests"]

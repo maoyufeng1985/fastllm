@@ -131,8 +131,11 @@ TTFT #1 − TTFT #0 = 41.58 s ≈ 一次 80K forward 的耗时。
 
 1. 80K C=2：先到的那条请求在 #1 prefill 期间不再停止产出，常见 decode 窗口内的
    聚合吞吐不低于当前 108.46 tok/s（不牺牲稳态），且 #0 的首阶段有持续推进。
-   （实施后实测：让位门达成；108.46 经同树 chunk off 零让位对照证明是
-   QPN2-on 时代 kernel 速率，本树不可达且与调度器无关，见 §5.1/§9。）
+   （实施后实测：让位门达成。108.46 当时经同树 chunk off 零让位对照证明是
+   QPN2-on 时代 kernel 速率，在 QPN2-off 的树上不可达且与调度器无关，见
+   §5.1/§9。2026-09-15 更正：QPN2 已可缺省开（warmup 崩溃已修），
+   common window 实测 115.39 tok/s 且保留 40 token 让位，本门在 QPN2-on
+   树上达标。）
 2. 长 prompt 不再垄断 GPU：单轮 forward 的 token 数受 `prefillChunkSize` 约束。
 3. C=1 与 8K 场景的数字不回退。
 4. 不改变权重格式、不改 checkpoint、不动 CUDA Graph 契约。
@@ -346,14 +349,14 @@ position 抽查：第二 chunk 的 `positionIds[0] == cacheLen + 2048`，不是 
 
 ### 5.1 判据（用 `Batch decode (common window)`）
 
-| 场景 | 指标 | 通过标准 | 实测（graph on，QPN2 off，`Qwen35MTPLoop`） |
+| 场景 | 指标 | 通过标准 | 实测（graph on，缺省 QPN2 on，`Qwen35MTPLoop`） |
 | --- | --- | --- | --- |
 | 80K C=2 | 请求 #0 在 #1 prefill 期间的 decode 产出 | **> 0 且持续**（改前为 0） | **40 token**（81920/2048，每 chunk 让位 1 次） |
-| 80K C=2 | common window 聚合 | ≥ 108.46 tok/s（不回退） | 75.83 tok/s。**108.46 在本树不可达，与调度器无关**：同树 chunk off 零让位对照实测 78.35（窗口 6.50 s，509 token，per-request 39.32/39.25，sha256 同 `ea2857f4`）。让位只解释 −2.5（78.35→75.83），其余 −30 是 batch-2 decode 速率本身（本树 39.3 vs 基线 54.23，QPN2-on 时代数字）。且按 `_common_decode_window` 定义（窗口 last TTFT→batch_end），聚合天生奖励零让位，mixed batch 只会更低。要回 108 走 kernel 线（QPN2/decode 速率），见 §7 |
+| 80K C=2 | common window 聚合 | ≥ 108.46 tok/s（不回退） | 75.83 tok/s（QPN2 off，graph on）。108.46 在 QPN2-off 的树上不可达，与调度器无关：同树 chunk off 零让位对照实测 78.35（窗口 6.50 s，509 token，per-request 39.32/39.25，sha256 同 `ea2857f4`）。让位只解释 −2.5（78.35→75.83），其余 −30 是 batch-2 decode 速率本身（QPN2-off 39.3 vs 基线 54.23）。且按 `_common_decode_window` 定义（窗口 last TTFT→batch_end），聚合天生奖励零让位。2026-09-15 更正：QPN2 缺省开后实测 **115.39 tok/s 且保留 40 token 让位，达标**（当日 16:12 在当前含 combine 二进制上复测；combine 之前的初版值是 110.10） |
 | 80K C=2 | TTFT #1 | ≤ 83.08 s（不回退） | 82.81 s ✓。83.08 本身就是守恒值 2×80K÷~1975 tok/s（对照：163840÷1996.83=82.05≈82.81；基线 163840÷1958.80=83.65≈83.09）。「明显小于」⟺ prefill 吞吐 ≫2000 tok/s，是 kernel 目标，调度器（含 PR-C）动不了；且等长 prompt 下与让位门互斥（yield>0 ⟹ #1 的 prefill 排在 #0 之后，`ShouldForceDecodeThisIteration` 要 decodeActive>0） |
-| 80K C=1 | decode | ≥ 61.16 tok/s（不回退） | 56.48 tok/s。chunk off 对照 56.64，所以不是调度器回退。本树必须 `FASTLLM_SM70_NVFP4_QPN2=0`，61.16 是 QPN2-on 基线 |
-| 8K C=4 | 聚合 | ≥ 当前值（不回退） | graph-on 129.27 tok/s；before last TTFT 12/8/4/0；sha256 `874972b7` 与 graphs-off 同 |
-| 任意 | greedy token 流 sha256 | 与改动前一致 | 8K C=2 `0e75bdf6` 对 `FASTLLM_LONG_PREFILL_CHUNK=0`；80K C=1 `9bb0aa71` 对 chunk off；80K C=2 `ea2857f4` 与 handoff-off 同 |
+| 80K C=1 | decode | ≥ 61.16 tok/s（不回退） | 56.48 tok/s（QPN2 off，graph on）。chunk off 对照 56.64，所以不是调度器回退。2026-09-15 更正：QPN2 缺省开后实测 **73.51 tok/s，达标**（61.16 是 QPN2-on 基线，原 QPN2-off 的树上不可测；73.51 同为当前含 combine 二进制复测值，初版 67.18） |
+| 8K C=4 | 聚合 | ≥ 当前值（不回退） | graph-on 129.27 tok/s（QPN2 off）；before last TTFT 12/8/4/0；sha256 见下行 |
+| 任意 | greedy token 流 sha256 | 与改动前一致 | 8K C=2 `5bfaac89` 对 `FASTLLM_LONG_PREFILL_CHUNK=0`（同二进制，C 单元保 sha 已证）；80K C=1 `9bb0aa71` 对 chunk off；80K C=2 `ea2857f4` 与 handoff-off 同。**口径警告（2026-09-15）**：`_token_stream_hash` 把全部生成 token 一起哈希，所以 sha 只在**同 `--output_tokens`** 下可比。曾把 `0e75bdf6`/`874972b7`（out=64）与 `5bfaac89`/`5b633030`（out=256）当成"跨二进制漂移"，那是口径错，已撤销；长度对齐后跨二进制稳定（80K C=1/C=2 各自横跨两次二进制一致）。详见落地方案 Appendix E |
 
 ### 5.2 必须同时盯的次生指标
 
@@ -368,7 +371,7 @@ position 抽查：第二 chunk 的 `positionIds[0] == cacheLen + 2048`，不是 
 ### 5.3 复现命令
 
 ```sh
-FASTLLM_SM70_NVFP4_QPN2=0 FASTLLM_PAGED_CUBLAS_CHUNK=2048 \
+FASTLLM_PAGED_CUBLAS_CHUNK=2048 \
 PYTHONPATH=build-sm70-tests/tools \
 python3 -m ftllm.cli benchmark /home/models/Qwen3.8-27B-QUASAR-NVFP4 \
   --tp 4 --cuda_embedding --max_batch 4 --tokens 167936 \
@@ -430,8 +433,22 @@ PR-C  重新定性（数据见 §5.1/§9）：两个候选形状都过不了剩�
       (b) mixed batch（prefill chunk + decode 同 forward）：改善 #0 的
           饿死/完成时间；TTFT #1 不变（prefill-bound），common window
           聚合不变或更低（decode 速率不动，挪到窗口外的 token 更多）。
-      108.46 / 61.16 是 QPN2-on 时代的 kernel 速率；要追就修 QPN2/N-pad
-      warmup 那条线，不在本方案范围。
+      108.46 / 61.16 是 QPN2-on 时代的 kernel 速率；在 QPN2-off 的树上
+      不可达。2026-09-15 更正：QPN2 已可缺省开，两条门均已达标
+      （当前二进制 115.39 / 73.51），故 (a)/(b) 不必做；要再追就修 QPN2/N-pad
+      warmup 那条线（已完成），不在本方案范围。
+
+      (c) 前置约束（顺序安全，先于 (a)/(b) 任何实现）：本方案今天安全的
+          前提是「同一条请求的 chunk 严格按序推进、不跨请求重排」。qwen3_5
+          的线性注意力层带递归状态（GDN recurrentState + convCache），
+          状态初始化点与回滚记账都依赖 chunk 顺序。PR-A 的 sha256 一致
+          （80K C=1 `9bb0aa71`、C=2 `ea2857f4`）就是这条前提成立的证据。
+          一旦 PR-C 要在同一个 forward 里交错两条请求的 chunk，或延后任一
+          条请求的**首个** chunk，必须先排除需要递归初始化的首 chunk，并让
+          可用窗口避开 `n_rs_seq`。参照 TurboPrefill（llama.cpp
+          discussion #24092 / PR #24219）的处理：它检测 `rs_z` 后把首 ubatch
+          踢出流水窗口（`turbo_start_ubatch = 1`），并把窗口收缩为
+          `(n_tokens - n_rs_seq - 1) / n_ubatch`。不照抄拓扑，只照抄这个守卫。
 ```
 
 PR-A 的让位门已过。B 是死路（抬 batch limit ≠ 重叠 prefill，TTFT #0 会
@@ -477,15 +494,21 @@ grep -n 'LongPrefillChunkEnabled\|ShouldForceDecodeThisIteration' \
 - `currentTokens` / `preTokens` / `promptLen` / `cacheLen` / `allTokens` 的读点
   已在 §4.1 列全。实施时按那张状态机改，不要只改 2240 的 `if`。
 - 真 MTP / DFlash 长文并发未做。选批分块只开在 `mtpDraftsPerStep == 0 && !DFlash`。
-- 80K C=1 graph-on decode 56.48 tok/s 对 chunk off 56.64。61.16 是
-  QPN2-on 基线，本树 warmup 会崩，不能拿来卡 PR-A。
-- 80K C=2 graph-on common window 75.83 对方案 108.46。已用同树 chunk off
-  零让位对照拆账：对照 78.35（窗口 6.50 s，509 token，per-request
+- 80K C=1 graph-on decode 56.48 tok/s 对 chunk off 56.64（均为 QPN2 off）。
+  61.16 是 QPN2-on 基线；原树 warmup 崩不能拿来卡 PR-A，2026-09-15 更正：
+  QPN2 缺省开后实测 73.51，本门达标（当前含 combine 二进制复测值）。
+- 80K C=2 graph-on common window 75.83（QPN2 off）对方案 108.46。已用同树
+  chunk off 零让位对照拆账：对照 78.35（窗口 6.50 s，509 token，per-request
   39.32/39.25，TTFT 41.01/82.10，sha256 同 `ea2857f4`）。让位只值 −2.5；
-  −30 来自 batch-2 decode 速率（本树 39.3 vs 基线 54.23）。108.46 是
-  QPN2-on 时代数字，本树不可达，mixed batch 也回不去——窗口定义
-  （`benchmark.py` `_common_decode_window`：last TTFT→batch_end）天生
-  奖励零让位。
+  −30 来自 QPN2-off 的 batch-2 decode 速率（39.3 vs 基线 54.23）。108.46 是
+  QPN2-on 时代数字，在 QPN2-off 的树上不可达，mixed batch 也回不去。窗口
+  定义（`benchmark.py` `_common_decode_window`：last TTFT→batch_end）天生
+  奖励零让位。**2026-09-15 当前二进制复测（QPN2 on）**：chunk off 121.90
+  （窗口 82.25+4.18 s，509 token，before-last-TTFT 1）对 chunk on 115.39/115.52
+  （82.87-82.95+4.07 s，470 token，让位 40），差值 −6.51；但同一对的
+  `Total time` 是 86.43 s 对 86.94 s，**只 +0.7%**，TTFT min/avg/max 在 1% 内。
+  即让位的真实墙钟代价 < 1%，−6.51 是窗口口径的产物。2026-09-15 更正：QPN2 缺省开后实测 115.39 且保留 40 token
+  让位，本门达标（当日 16:12 在当前含 combine 二进制上复测）。
 - 80K C=2 TTFT #1 守恒检查：163840 ÷ 1996.83 = 82.05 s ≈ 实测 82.81；
   基线 163840 ÷ 1958.80 = 83.65 ≈ 83.09。「明显 <83.08」⟺ prefill 吞吐
   ≫2000 tok/s（kernel 目标）。等长 prompt 下它与让位门互斥：
