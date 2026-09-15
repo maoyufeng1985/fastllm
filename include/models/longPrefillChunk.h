@@ -4,6 +4,7 @@
 #include "basellm.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace fastllm {
@@ -92,6 +93,26 @@ inline int SelectPrefillChunkLen(const ResponseContext *ctx,
     return curLen;
 }
 
+// Round-robin ticket for in-flight prefills. Opt-in (FASTLLM_PREFILL_ROTATE=1)
+// because it reverses the deliberate starvation in PrefillOrderSortKey below:
+// with two long prompts, the default lets one run to completion and only then
+// starts the peer, so the later request waits for the whole first prefill.
+// Rotating at *chunk* granularity gives each request one chunk in turn, which
+// keeps both in flight; it does not split a chunk between requests, so it is
+// not the slice-level ping-pong that comment warns about.
+inline unsigned long long NextPrefillTicket() {
+    static std::atomic<unsigned long long> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline bool PrefillRotationEnabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("FASTLLM_PREFILL_ROTATE");
+        return env != nullptr && env[0] != '0';
+    }();
+    return enabled;
+}
+
 inline int PrefillOrderSortKey(const ResponseContext *ctx) {
     if (ctx == nullptr) {
         return 0;
@@ -101,6 +122,9 @@ inline int PrefillOrderSortKey(const ResponseContext *ctx) {
     // peer that then loses the token-budget skip must not let it jump
     // the queue (two 80K jobs would otherwise ping-pong 2048 slices).
     if (ctx->prefillRemaining > 0 && ctx->preTokens > 0) {
+        if (PrefillRotationEnabled()) {
+            return -(remaining + 1000000000) + ctx->prefillTicket;
+        }
         return -(remaining + 1000000000);
     }
     return -remaining;

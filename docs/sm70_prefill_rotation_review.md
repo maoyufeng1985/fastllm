@@ -11,9 +11,10 @@
    80K 请求来回 ping-pong 2048 的块"。
 2. **串行已被两组独立数据确认**：`inFlight` 在任何一轮都不超过 1；2×20K 的
    TTFT 是 8.2 s 对 16.5 s（正好一倍）。
-3. **轮转避开了一条已知会崩的路径。** "同批两条 prefill"在三种配置下全部
-   段错误（见 §3），而轮转是每轮只跑**一条** chunk、走 batch-1 前向。所以轮转
-   不只是"换一种公平性"，它是当前唯一能绕开崩溃拿到并发 prefill 的形状。
+3. **轮转实现了，而且它暴露了一个真 bug，不是避开一个。** 轮转（本仓库新增
+   `FASTLLM_PREFILL_ROTATE`）让 `inFlight` 第一次达到 **2**——两条长 prefill
+   真正同时在飞——而那一刻**段错误**（§3.2）。所以"两条同时 in-flight"是坏的，
+   串行一直在掩盖它。§3.1 还更正了本文件初版的两条假复现。
 4. **但轮转买不到吞吐。** 两条长请求的 prefill 总计算量不变，轮转只改变谁先
    完成：后者 TTFT 显著改善，**前者 TTFT 等比例变差**。净效果是延迟的再分配。
 
@@ -68,30 +69,41 @@ FP8 KV、`--tokens 500000`、`--batch 2`、`--input_tokens 200000`：
 
 两级长度（20K 与 200K）都给出"max ≈ 2 × min"，这是串行的独立佐证。
 
-## 3. "同批两条 prefill"会崩（复现三次）
+## 3. 崩溃：更正与真复现
 
-为了做轮转的对照，试着放宽准入预算让两条 chunk 进同一个 forward。四次配置：
+### 3.1 更正上一版的两条错误复现
 
-| 准入预算 | chunk | 预热分配 | 结果 |
-|---:|---:|---:|---|
-| 2048（缺省） | 2048 | 2048 | 正常（串行）|
-| 4608 | 2048 | 4608 | **OOM**（预热跟着预算放大）|
-| 2112 | 1024 | 2112 | **Xid 31 + 段错误** |
-| 4096（预热已解耦） | 2048 | 2048 | **段错误** |
-| 4096 | 2048 | 2048 | **段错误**（2×20K，与长度无关）|
-| 2048 | 1024 | 2048 | **段错误**（2×8K，均匀路径）|
+本文件初版把以下两跑记成"段错误"，并据此断言"同批两条 prefill 必崩"：
 
-**第三条把"预热缓冲放大"这个原因排除了**：显式把预热钉回一个 chunk
-（`servingPrefillTokenLimit = GetChunkedPrefillSize()`）之后，仍然崩。
-最后两条把范围进一步缩小：**与上下文长度无关**（20K 也崩）、**与 ragged 与否
-无关**（两条 seqLen 相同时走均匀批量路径，也崩）。
+| 配置 | 初版记录 | **干净源码复跑** |
+|---|---|---|
+| chunk 1024 / 预算 2112 | Xid 31 + 段错误 | **exit 0，不崩** |
+| chunk 1024 / 预算 2048（2×8K）| 段错误 | **exit 0，不崩** |
 
-所以"一个 forward 装两条 prefill"是条从未被走过的路径，一进就段错误。它平时
-不可达，正是因为准入预算只放一条 chunk；这也解释了为什么它没在别处暴露。
-（该路径由 `7fdfe119` "修复 Qwen3.5 服务期显存池未命中" 引入。）
+两次复跑都不崩。当时的库处于**撤改代码后重建的中间状态**，所以那两条是脏构建
+的假象。**更正：不能用它们支撑"同批两条必崩"的结论。**
 
-**这不是新回归，是长期休眠的路径。** 复现方式对工程有用，所以完整记录在
-§5。修它属于独立工作：GPU MMU 故障说明是地址记账错了，不是参数没调好。
+### 3.2 真复现：两条 in-flight prefill 会崩
+
+干净源码、`FASTLLM_PREFILL_ROTATE=1`（轮转把预算抬到 2×chunk，让两条同时
+in-flight）后，最小样本段错误：
+
+```
+FASTLLM_PREFILL_ROTATE=1 FASTLLM_SCHED_TRACE=1 python3 -m ftllm.cli benchmark \
+  /home/models/Qwen3.8-27B-QUASAR-NVFP4 --tp 4 --cuda_embedding --max_batch 4 \
+  --tokens 65536 --dtype auto --enable_thinking false --prefix_cache false \
+  --input_tokens 20480 --output_tokens 32 --batch 2 --warmup 0 --temperature 0 --top_k 1
+```
+
+结果：**exit 139（段错误）**，而调度日志显示 `inFlight` 达到 **2**——这是本项目
+里第一次让两条长 prefill 真正同时在飞。此前所有配置（缺省、chunk 1024/2048、
+预算 2048/2112/4096）的 `inFlight` 上限都是 1，串行**掩盖**了这个 bug。
+
+所以真实情况是：
+
+- 串行不是"实现不了并发"，而是**并发的 bug 被串行挡住了**；
+- 一旦让两条同时 in-flight（轮转或放预算），就踩到它；
+- 这也解释了 §3.1 的假象：当时我以为改预算就能复现，其实那两次是脏构建。
 
 ## 4. 轮转的收益：只有公平性，没有吞吐
 
@@ -142,5 +154,15 @@ FASTLLM_SCHED_TRACE=1 FASTLLM_PREFILL_BATCH_TOKEN_LIMIT=2048 python3 -m ftllm.cl
 - `src/models/qwen3_5.cpp` 的调度诊断字段（`sel` / `preTok` / `rem` /
   `inFlight`）**保留**：零开销、`FASTLLM_SCHED_TRACE` 缺省关，是回答"到底谁在
   跑"的唯一手段。
-- 准入预算 override 与预热口径解耦**已撤除**，缺省行为与改动前逐位一致
-  （缺省 2×20K 复跑 exit 0，Total time 16.90 s）。
+- **轮转实现保留，缺省关**：`FASTLLM_PREFILL_ROTATE=1` 时
+  `PrefillOrderSortKey` 在 in-flight 分支里改用轮转票（`ResponseContext::
+  prefillTicket`，在每次入选 prefill 时盖新票），`GetBatchedPrefillTokenLimit()`
+  同时把预算抬到 2×chunk——两者缺一不可：只改排序会在 `alreadyInBatch=1` 时
+  因 `SelectPrefillChunkLen` 返回 0 被跳过（实测 trace 里 `sched=0`），排序根本
+  走不到。
+- **缺省行为逐位不变**：轮转关时 2×20K 复跑 exit 0、Total time 16.90 s、
+  `inFlight` 上限 1，与改动前一致（改动前是 16.8993–16.90 s）。
+
+保留轮转代码的理由不是"它能用"（开着自己会崩），而是**它是暴露并复现
+§3.2 那个 bug 的唯一开关**。修 bug 时需要一个能稳定触发 `inFlight=2` 的入口，
+删掉它下次还得重新实现。

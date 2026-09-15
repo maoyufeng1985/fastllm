@@ -10119,6 +10119,16 @@ namespace fastllm {
         // sum of unrelated short prompts needlessly splits, for example, 32
         // 92-token requests into 22 + 10 prefills.  Preserve an explicit user
         // chunk limit, otherwise use the model's normal aggregate budget.
+        //
+        // The explicit chunk size bounds how much one request may feed, but it
+        // is also what makes a second long prompt compute a zero-length chunk
+        // and get skipped every round. Rotating between two in-flight prefills
+        // needs room for two slices in one budget, so rotation raises the
+        // admission budget to two chunks. Slices stay whole, so a forward
+        // still carries one chunk per request, not a split chunk.
+        if (PrefillRotationEnabled()) {
+            return 2 * this->GetChunkedPrefillSize();
+        }
         if (this->chunkedPrefillSize >= 0) {
             return this->chunkedPrefillSize;
         }
@@ -22861,6 +22871,9 @@ namespace fastllm {
                         if (longPrefillChunk) {
                             ArmChunkedPrefill(ctx, prefillChunkSize);
                         }
+                        // Stamp the round-robin ticket so the next selection
+                        // prefers whichever in-flight prefill waited longest.
+                        ctx->prefillTicket = NextPrefillTicket();
                     }
 
                     if (!isPrompt && !ctx->currentTokens.empty()) {

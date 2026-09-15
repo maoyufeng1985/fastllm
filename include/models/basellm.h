@@ -59,6 +59,12 @@ namespace fastllm {
         // and the request stays prefill-eligible even after preTokens > 0.
         int prefillRemaining = 0;
 
+        // Round-robin ticket, stamped when this request is admitted for a
+        // prefill chunk. Ordering by it alternates in-flight prefills instead
+        // of letting one run to completion. Only read when
+        // FASTLLM_PREFILL_ROTATE is set.
+        unsigned long long prefillTicket = 0;
+
         ~ResponseContext();
 
         void Init(int blocks, DataType dataType, DataType kvCacheDataType);
