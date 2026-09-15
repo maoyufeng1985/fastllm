@@ -71,15 +71,19 @@ bool Fp8QpnGemm(const uint8_t *codes, const half *groupScales,
 // FASTLLM_SM70_QPN / FASTLLM_SM70_NVFP4_QPN2 are not explicitly disabled.
 bool Nvfp4QpnSupported();
 
-// Shape gate: 1 <= M <= 32, K % 64 == 0, N % 32 == 0, and K/16 is divisible
-// by a supported split-K in {8, 16, 32}.
+// Shape gate: 1 <= M <= 32, K % 64 == 0, N > 0, and K/16 is divisible by a
+// supported split-K in {8, 16, 32}. N need not be a multiple of 32: the
+// sidecar pads to the 32-column tile and the GEMM masks the partial tile's
+// stores.
 bool Nvfp4QpnCanRun(int m, int k, int n);
 
 // Weight preparation. weight is the source [N, K/2] row-major packed NVFP4
 // bytes (even K in the low nibble). scales is [N, K/16] row-major FP8_E4M3
 // group scales. codes and packedScales receive the QPN2 fragment layout;
 // the caller owns and must allocate codes (N*K/2 bytes) and packedScales
-// (N*K/16 bytes). All pointers are device pointers.
+// (N*K/16 bytes). All pointers are device pointers. This entry point requires
+// N % 32 == 0 and does not pad; use Nvfp4QpnPrepareFromNative for a weight
+// whose logical N is not a multiple of the tile.
 bool Nvfp4QpnPrepare(const uint8_t *weight, const uint8_t *scales,
                      uint8_t *codes, uint8_t *packedScales,
                      int k, int n, cudaStream_t stream);
@@ -89,22 +93,45 @@ bool Nvfp4QpnPrepare(const uint8_t *weight, const uint8_t *scales,
 // This converts that layout into the QPN2 fragment layout (codes then raw
 // E4M3) by unfusing `fp32 / globalScale`, matching 1Cat-vLLM's raw-E4M3 +
 // weight_global_scale contract. GEMM must be called with the same globalScale.
-// Failure leaves the source untouched. Persistent size is N*K*9/16, which
-// fits in the native N*K*12/16 allocation. `dest == nullptr` overwrites
-// `storage` in place; otherwise packed codes/scales are written to `dest`
-// and the native source is preserved for the large-M path.
+// Failure leaves the source untouched.
+//
+// `n` is both the logical output dim and the row count present in `storage`.
+// The sidecar holds Nvfp4QpnPackedRows(n) rows; columns in [n, packedN) have
+// no source row and are written as zero so the GEMM's last tile reads defined
+// bytes. When n is already a multiple of 32 this is byte-identical to the
+// unpadded path.
+//
+// `dest == nullptr` overwrites `storage` in place (the padded persistent size
+// fits in the native N*K*12/16 allocation); otherwise codes and scales are
+// written to `dest` and the native source is preserved for the large-M path.
 bool Nvfp4QpnPrepareFromNative(uint8_t *storage, size_t storageBytes,
                                int k, int n, float globalScale,
                                cudaStream_t stream, uint8_t *dest = nullptr,
                                size_t destBytes = 0);
 
-// QPN2 persistent bytes: packed codes (N*K/2) followed by E4M3 scales (N*K/16).
+// Output rows the packed sidecar must hold: the QPN2 tile is 32 columns wide.
+inline int Nvfp4QpnPackedRows(int n) {
+  return (n + 31) / 32 * 32;
+}
+
+// QPN2 persistent bytes: packed codes then E4M3 scales, both over the padded
+// row count.
 inline size_t Nvfp4QpnPackedBytes(int k, int n) {
-  return static_cast<size_t>(n) * k / 2 + static_cast<size_t>(n) * k / 16;
+  const size_t rows = static_cast<size_t>(Nvfp4QpnPackedRows(n));
+  return rows * k / 2 + rows * k / 16;
+}
+
+// Byte offset of the packed scales inside the sidecar above.
+inline size_t Nvfp4QpnScaleOffset(int k, int n) {
+  return static_cast<size_t>(Nvfp4QpnPackedRows(n)) * k / 2;
 }
 
 // Dense GEMM: out[m, n] = in[m, k] @ dequant(W) * globalScale.
-// codes/packedScales are the buffers produced by Nvfp4QpnPrepare.
+// codes/packedScales are the buffers produced by Nvfp4QpnPrepareFromNative or
+// Nvfp4QpnPrepare. The last 32-column tile is masked rather than cropped, so
+// the sidecar must be sized for Nvfp4QpnPackedRows(n) columns: that is what
+// Nvfp4QpnPackedBytes and Nvfp4QpnScaleOffset report, for the same (k, n) the
+// sidecar was prepared with.
 // Returns false (without writing out) when the shape is not supported.
 bool Nvfp4QpnGemm(const uint8_t *codes, const uint8_t *packedScales,
                   const half *in, half *out,

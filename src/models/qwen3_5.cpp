@@ -9682,6 +9682,49 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
+        {
+            // The QPN2 sidecar is a plain cudaMalloc. Build every eligible one
+            // now, while all TP workers are idle and no stream is capturing:
+            // lazily building on the first decode call would run the
+            // allocation and its stream synchronize inside CUDA Graph capture.
+            const int previousDevice = FastllmCudaGetDevice();
+            int prepared = 0;
+            auto prepare = [&](Data &local) {
+                if (local.dataType != DataType::NVFP4_BLOCK_16 ||
+                    local.dataDevice != DataDevice::CUDA ||
+                    local.dataDeviceIds.empty() || local.IsRepacked ||
+                    local.nvfp4Qpn2Packed != nullptr) {
+                    return;
+                }
+                FastllmCudaSetDevice(local.dataDeviceIds.front());
+                if (FastllmCudaWarmupNvfp4Qpn2Sm70(local)) {
+                    prepared++;
+                }
+            };
+            try {
+                for (auto &item : this->weight.weight) {
+                    Data &data = item.second;
+                    if (data.multiDeviceData) {
+                        for (auto &shard : data.multiDeviceDatas) {
+                            if (shard.second != nullptr) {
+                                prepare(*shard.second);
+                            }
+                        }
+                    } else {
+                        prepare(data);
+                    }
+                }
+            } catch (...) {
+                FastllmCudaSetDevice(previousDevice);
+                throw;
+            }
+            FastllmCudaSetDevice(previousDevice);
+            if (prepared > 0) {
+                printf("[Qwen3.5] warmup: prepared %d SM70 NVFP4 QPN2 sidecars.\n",
+                       prepared);
+                fflush(stdout);
+            }
+        }
         if (GetFastllmEnv().cudaGraph && !cudaServingPrepared) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();

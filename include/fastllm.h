@@ -520,6 +520,11 @@ namespace fastllm {
         // SM70 NVFP4 QPN2 packed sidecar. Native/TurboMind layout stays in
         // cudaData so prefill (M > 32) can keep the 1Cat large-M path.
         void *nvfp4Qpn2Packed = nullptr;
+        // Set once this weight's shape is known to be QPN2-eligible, whether or
+        // not the sidecar has been built yet. TurboMind's layout preparation
+        // rewrites cudaData in place and would destroy the native layout QPN2
+        // still needs, so it must refuse while this is set.
+        bool nvfp4Qpn2Wanted = false;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
         // Set only when this object owns entries in the DeepSeek-V4 CUDA
         // route-table registry, so ordinary temporary tensors can skip the

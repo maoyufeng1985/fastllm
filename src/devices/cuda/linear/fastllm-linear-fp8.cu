@@ -3587,7 +3587,12 @@ static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
     if (FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
         return true;
     }
+    // TurboMind's preparation rewrites cudaData in place. Once a weight's shape
+    // belongs to QPN2, that would destroy the native layout the QPN2 sidecar is
+    // built from and permanently disable QPN2 for this weight, so refuse and
+    // let the caller fall through to the non-destructive dequant path.
     if (weight.cudaData == nullptr || weight.IsRepacked ||
+        weight.nvfp4Qpn2Wanted ||
         weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
         weight.blockM != 16 || weight.blockK != 1) {
         return false;
@@ -3599,6 +3604,13 @@ static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
     }
     weight.IsRepacked = true;
     return true;
+}
+
+// True when this weight's shape belongs to QPN2, independent of whether the
+// sidecar has been built yet. Callers use it to make the decision sticky.
+static bool FastllmCudaNvfp4Qpn2Eligible(int inputDim, int outputDim) {
+    return fastllm::sm70::Nvfp4QpnSupported() &&
+           fastllm::sm70::Nvfp4QpnCanRun(1, inputDim, outputDim);
 }
 
 static bool FastllmCudaEnsureNVFP4Qpn2Layout(
@@ -3614,25 +3626,50 @@ static bool FastllmCudaEnsureNVFP4Qpn2Layout(
     if (weight.cudaData == nullptr || weight.IsRepacked ||
         weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
         weight.blockM != 16 || weight.blockK != 1 ||
-        !fastllm::sm70::Nvfp4QpnSupported() ||
-        !fastllm::sm70::Nvfp4QpnCanRun(1, inputDim, outputDim)) {
+        !FastllmCudaNvfp4Qpn2Eligible(inputDim, outputDim)) {
         return false;
     }
+    // Claim the shape before allocating. A failed build must leave the native
+    // layout intact so a later call can retry, and so TurboMind never repacks
+    // this weight in place.
+    weight.nvfp4Qpn2Wanted = true;
     const size_t packedBytes =
         fastllm::sm70::Nvfp4QpnPackedBytes(inputDim, outputDim);
     void *packed = FastllmCudaMalloc(packedBytes);
     if (packed == nullptr) {
+        printf("Fastllm SM70 NVFP4 QPN2 sidecar alloc failed "
+               "(K=%d N=%d bytes=%zu); this weight stays on the native "
+               "dequant path.\n",
+               inputDim, outputDim, packedBytes);
         return false;
     }
     if (!fastllm::sm70::Nvfp4QpnPrepareFromNative(
             static_cast<uint8_t *>(weight.cudaData), weight.GetBytes(),
             inputDim, outputDim, FastllmCudaNVFP4Qpn2GlobalScale(weight),
             cudaStreamPerThread, static_cast<uint8_t *>(packed), packedBytes)) {
+        printf("Fastllm SM70 NVFP4 QPN2 sidecar conversion failed "
+               "(K=%d N=%d); this weight stays on the native dequant path.\n",
+               inputDim, outputDim);
         FastllmCudaFree(packed);
         return false;
     }
     weight.nvfp4Qpn2Packed = packed;
     return true;
+}
+
+bool FastllmCudaWarmupNvfp4Qpn2Sm70(fastllm::Data &weight) {
+    if (weight.nvfp4Qpn2Packed != nullptr) {
+        return true;
+    }
+    // NVFP4_BLOCK_16 Linear weights are stored [outputDim, inputDim].
+    if (weight.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.dims.size() != 2 || weight.cudaData == nullptr ||
+        weight.IsRepacked) {
+        return false;
+    }
+    return FastllmCudaEnsureNVFP4Qpn2Layout(weight, weight.dims[1],
+                                            weight.dims[0]);
 }
 
 static bool FastllmCudaTryNVFP4Qpn2(
@@ -3645,8 +3682,14 @@ static bool FastllmCudaTryNVFP4Qpn2(
         !fastllm::sm70::Nvfp4QpnCanRun(n, m, k)) {
         return false;
     }
+    // Make the shape decision sticky before attempting the build. Building the
+    // sidecar allocates and synchronizes, which cannot happen inside capture,
+    // so a deferred or failed build has to leave the weight on the
+    // non-destructive path rather than let TurboMind repack it in place.
+    weight.nvfp4Qpn2Wanted = true;
     if (!FastllmCudaHasNVFP4Qpn2Layout(weight)) {
         if (!FastllmCudaGetNcclForceSync() ||
+            FastllmCudaGraphIsCapturingFast() ||
             !FastllmCudaEnsureNVFP4Qpn2Layout(weight, m, k)) {
             return false;
         }
@@ -3655,7 +3698,8 @@ static bool FastllmCudaTryNVFP4Qpn2(
     half *cudaInput = static_cast<half *>(FastllmCudaPrepareInput(input));
     half *cudaOutput = static_cast<half *>(FastllmCudaPrepareOutput(output));
     const auto *codes = static_cast<const uint8_t *>(weight.nvfp4Qpn2Packed);
-    const auto *packedScales = codes + static_cast<size_t>(k) * m / 2;
+    const auto *packedScales =
+        codes + fastllm::sm70::Nvfp4QpnScaleOffset(m, k);
     const float globalScale = FastllmCudaNVFP4Qpn2GlobalScale(weight);
     bool ok = fastllm::sm70::Nvfp4QpnGemm(
         codes, packedScales, cudaInput, cudaOutput, n, m, k,
@@ -3728,7 +3772,8 @@ bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Dat
                                       cudaStreamPerThread>>>(
             cudaInput, cudaFp16Input, inputLen);
         const auto *codes = static_cast<const uint8_t *>(weight.nvfp4Qpn2Packed);
-        const auto *packedScales = codes + static_cast<size_t>(k) * m / 2;
+        const auto *packedScales =
+            codes + fastllm::sm70::Nvfp4QpnScaleOffset(m, k);
         const float globalScale = FastllmCudaNVFP4Qpn2GlobalScale(weight);
         const bool ok = fastllm::sm70::Nvfp4QpnGemm(
             codes, packedScales, cudaFp16Input, cudaFp16Output, n, m, k,

@@ -218,7 +218,7 @@ bool RunCase(const Case& c, float relTol) {
   return rel <= relTol;
 }
 
-bool RunNativeCase(const Case& c, float relTol) {
+bool RunNativeCase(const Case& c, float relTol, bool outOfPlace = false) {
   Rng rng(static_cast<uint32_t>(c.m * 70000 + c.k * 300 + c.n + 17));
   const int groups = c.k / 16;
   const size_t rowBytes = static_cast<size_t>(groups) * 12;
@@ -252,13 +252,38 @@ bool RunNativeCase(const Case& c, float relTol) {
   }
 
   uint8_t* dStorage = nullptr;
+  uint8_t* dSidecar = nullptr;
   half* dIn = nullptr;
   half* dOut = nullptr;
-  if (!CheckCuda(cudaMalloc(&dStorage, native.size()), "malloc native") ||
+  // The sidecar is padded up to the 32-column tile, so it can need more room
+  // than the native source. The tail canary catches a partial tile writing
+  // past the logical row width: an overflowing row corrupts the start of the
+  // next one and shows up in the oracle, while the last row would land past
+  // the buffer.
+  const size_t packedBytes = fastllm::sm70::Nvfp4QpnPackedBytes(c.k, c.n);
+  // `outOfPlace` mirrors the engine: storage exactly the native source size,
+  // sidecar a separate Nvfp4QpnPackedBytes allocation. In place, storage has to
+  // hold both.
+  const size_t storageBytes =
+      outOfPlace ? native.size() : std::max(native.size(), packedBytes);
+  const size_t outElements = static_cast<size_t>(c.m) * c.n;
+  constexpr int kCanary = 32;
+  constexpr uint16_t kSentinel = 0x7e01;
+
+  if (!CheckCuda(cudaMalloc(&dStorage, storageBytes), "malloc native") ||
+      (outOfPlace &&
+       !CheckCuda(cudaMalloc(&dSidecar, packedBytes), "malloc sidecar")) ||
       !CheckCuda(cudaMalloc(&dIn, input.size() * sizeof(half)), "malloc native in") ||
-      !CheckCuda(cudaMalloc(&dOut, static_cast<size_t>(c.m) * c.n * sizeof(half)),
+      !CheckCuda(cudaMalloc(&dOut, (outElements + kCanary) * sizeof(half)),
                  "malloc native out")) {
     return false;
+  }
+  {
+    std::vector<half> seeded(outElements + kCanary,
+                             __ushort_as_half(kSentinel));
+    CheckCuda(cudaMemcpy(dOut, seeded.data(), seeded.size() * sizeof(half),
+                         cudaMemcpyHostToDevice),
+              "seed native canary");
   }
   CheckCuda(cudaMemcpy(dStorage, native.data(), native.size(),
                        cudaMemcpyHostToDevice),
@@ -269,20 +294,24 @@ bool RunNativeCase(const Case& c, float relTol) {
 
   const auto release = [&]() {
     cudaFree(dStorage);
+    if (dSidecar != nullptr) {
+      cudaFree(dSidecar);
+    }
     cudaFree(dIn);
     cudaFree(dOut);
   };
 
   if (!fastllm::sm70::Nvfp4QpnPrepareFromNative(
-          dStorage, native.size(), c.k, c.n, c.globalScale,
-          cudaStreamPerThread)) {
+          dStorage, storageBytes, c.k, c.n, c.globalScale,
+          cudaStreamPerThread, dSidecar, packedBytes)) {
     std::fprintf(stderr, "  [%s] native prepare failed\n", c.name);
     release();
     return false;
   }
+  uint8_t* sidecar = dSidecar != nullptr ? dSidecar : dStorage;
   const bool ran = fastllm::sm70::Nvfp4QpnGemm(
-      dStorage, dStorage + static_cast<size_t>(c.n) * c.k / 2, dIn, dOut, c.m,
-      c.k, c.n, c.globalScale, cudaStreamPerThread);
+      sidecar, sidecar + fastllm::sm70::Nvfp4QpnScaleOffset(c.k, c.n), dIn,
+      dOut, c.m, c.k, c.n, c.globalScale, cudaStreamPerThread);
   if (!ran) {
     std::fprintf(stderr, "  [%s] native gemm refused\n", c.name);
     release();
@@ -290,10 +319,16 @@ bool RunNativeCase(const Case& c, float relTol) {
   }
   CheckCuda(cudaStreamSynchronize(cudaStreamPerThread), "native sync");
 
-  std::vector<half> out(static_cast<size_t>(c.m) * c.n);
-  CheckCuda(cudaMemcpy(out.data(), dOut, out.size() * sizeof(half),
+  std::vector<half> outFull(outElements + kCanary);
+  CheckCuda(cudaMemcpy(outFull.data(), dOut, outFull.size() * sizeof(half),
                        cudaMemcpyDeviceToHost),
             "copy native out");
+  int canaryHits = 0;
+  for (int i = 0; i < kCanary; ++i) {
+    if (__half_as_ushort(outFull[outElements + i]) != kSentinel) {
+      ++canaryHits;
+    }
+  }
 
   double num = 0.0, den = 0.0;
   for (int m = 0; m < c.m; ++m) {
@@ -308,16 +343,19 @@ bool RunNativeCase(const Case& c, float relTol) {
         acc += __half2float(input[static_cast<size_t>(m) * c.k + k]) *
                E2M1ToFloat(fp4) * Fp8E4M3ToFloat(scaleCode) * c.globalScale;
       }
-      const float got = __half2float(out[static_cast<size_t>(m) * c.n + n]);
+      const float got =
+          __half2float(outFull[static_cast<size_t>(m) * c.n + n]);
       num += static_cast<double>(got - acc) * (got - acc);
       den += static_cast<double>(acc) * acc;
     }
   }
   const float rel = den > 0.0 ? static_cast<float>(std::sqrt(num / den)) : 0.0f;
-  std::printf("  [%s] native m=%d k=%d n=%d relL2=%.3e %s\n", c.name, c.m, c.k,
-              c.n, rel, rel <= relTol ? "OK" : "FAIL");
+  const bool ok = rel <= relTol && canaryHits == 0;
+  std::printf("  [%s] native m=%d k=%d n=%d%s%s relL2=%.3e canary=%d %s\n",
+              c.name, c.m, c.k, c.n, c.n % 32 == 0 ? "" : " padded",
+              outOfPlace ? " split" : "", rel, canaryHits, ok ? "OK" : "FAIL");
   release();
-  return rel <= relTol;
+  return ok;
 }
 
 }  // namespace
@@ -377,9 +415,25 @@ int main(int argc, char** argv) {
       {4, 1536, 256, 1.0f, "native_k1536"},
       {4, 256, 256, 0.25f, "native_m4_scale"},
       {16, 256, 256, 0.125f, "native_m16_scale"},
+      // Logical N not a multiple of the 32-column tile. 5120x4120 is the
+      // TP4-local GDN-in shape this padding exists for.
+      {1, 5120, 4120, 1.0f, "native_pad_gdn"},
+      {16, 512, 260, 1.0f, "native_pad_m16"},
+      {4, 256, 300, 0.25f, "native_pad_m4_scale"},
   };
   for (const Case& c : nativeCases) {
     allOk = RunNativeCase(c, 3e-3f) && allOk;
+  }
+
+  // Same shapes again through the engine's allocation split: storage exactly
+  // the native source, sidecar a separate Nvfp4QpnPackedBytes buffer.
+  const Case splitCases[] = {
+      {4, 256, 256, 1.0f, "split_m4"},
+      {1, 5120, 4120, 1.0f, "split_pad_gdn"},
+      {16, 512, 260, 0.125f, "split_pad_m16"},
+  };
+  for (const Case& c : splitCases) {
+    allOk = RunNativeCase(c, 3e-3f, true) && allOk;
   }
 
   if (!allOk) {

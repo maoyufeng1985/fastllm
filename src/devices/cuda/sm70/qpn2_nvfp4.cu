@@ -87,12 +87,14 @@ __device__ __forceinline__ uint8_t float_to_e4m3(float value) {
   return static_cast<uint8_t>(sign | ((halfBits >> 7) & 0x7fu));
 }
 
-// Native interleaved [N, (K/16)*12] → QPN2 fragment codes. Same index
-// mapping as nvfp4_qpn2_prepack_codes_kernel, but the source is eight
-// packed E2M1 bytes plus a trailing FP32 scale per group of 16.
+// Native interleaved [source_n, (K/16)*12] → QPN2 fragment codes over
+// Nvfp4QpnPackedRows(n) columns. Same index mapping as
+// nvfp4_qpn2_prepack_codes_kernel, but the source is eight packed E2M1 bytes
+// plus a trailing FP32 scale per group of 16. Columns at or past source_n
+// have no source row, so they are written as zero.
 __global__ void nvfp4_qpn2_prepack_codes_from_native_kernel(
     uint8_t* __restrict__ output, const uint8_t* __restrict__ source, int n,
-    int k, int source_row_bytes) {
+    int source_n, int k, int source_row_bytes) {
   const size_t index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t numel = static_cast<size_t>(n) * k / 2;
@@ -108,6 +110,10 @@ __global__ void nvfp4_qpn2_prepack_codes_from_native_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int column = tile * 32 + qpn2_col_from_lane(lane);
+  if (column >= source_n) {
+    output[index] = 0;
+    return;
+  }
   const int local_k0 = qpn2_logical_k(physical_byte * 2);
   const int local_k1 = qpn2_logical_k(physical_byte * 2 + 1);
   const uint8_t* block =
@@ -124,7 +130,7 @@ __global__ void nvfp4_qpn2_prepack_codes_from_native_kernel(
 
 __global__ void nvfp4_qpn2_prepack_scales_from_native_kernel(
     uint8_t* __restrict__ output, const uint8_t* __restrict__ source, int n,
-    int k, int source_row_bytes, float global_scale) {
+    int source_n, int k, int source_row_bytes, float global_scale) {
   const size_t index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t numel = static_cast<size_t>(n) * k / 16;
@@ -138,6 +144,10 @@ __global__ void nvfp4_qpn2_prepack_scales_from_native_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int column = tile * 32 + qpn2_col_from_lane(lane);
+  if (column >= source_n) {
+    output[index] = 0;
+    return;
+  }
   const uint8_t* block =
       source + static_cast<size_t>(column) * source_row_bytes +
       static_cast<size_t>(group) * 12;
@@ -303,7 +313,9 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
     }
     const int output_row = row_base + (element >> 5);
     const int output_col = element & 31;
-    if (output_row < m) {
+    // n is the logical output dim, so the last tile may be partial. Those
+    // columns read the sidecar's zero padding and are not stored.
+    if (output_row < m && tile * 32 + output_col < n) {
       output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
           __float2half(value);
     }
@@ -315,7 +327,7 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                  half* output, int n, int k, int m, float global_scale,
                  cudaStream_t stream) {
   constexpr int kRowsPerCta = kQpn2RowsPerCta * RowTiles;
-  const dim3 grid(n / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
+  const dim3 grid((n + 31) / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
   nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles>
       <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n, k,
                                            m, global_scale);
@@ -371,7 +383,7 @@ bool Nvfp4QpnSupported() {
 }
 
 bool Nvfp4QpnCanRun(int m, int k, int n) {
-  if (m < 1 || m > 32 || n <= 0 || n % 32 != 0 || k <= 0 || k % 64 != 0) {
+  if (m < 1 || m > 32 || n <= 0 || k <= 0 || k % 64 != 0) {
     return false;
   }
   return ChooseSplitK(k) != -1;
@@ -405,13 +417,16 @@ bool Nvfp4QpnPrepareFromNative(uint8_t* storage, size_t storageBytes,
                                int k, int n, float globalScale,
                                cudaStream_t stream, uint8_t* dest,
                                size_t destBytes) {
-  if (storage == nullptr || k <= 0 || n <= 0 || k % 64 != 0 || n % 32 != 0) {
+  if (storage == nullptr || k <= 0 || n <= 0 || k % 64 != 0) {
     return false;
   }
   const size_t sourceRowBytes = static_cast<size_t>(k / 16) * 12;
   const size_t sourceBytes = static_cast<size_t>(n) * sourceRowBytes;
-  const size_t codeBytes = static_cast<size_t>(n) * k / 2;
-  const size_t scaleBytes = static_cast<size_t>(n) * k / 16;
+  // Columns at or past n have no source row, so the sidecar is sized for the
+  // padded row count while the source bound stays at n.
+  const int packedN = Nvfp4QpnPackedRows(n);
+  const size_t codeBytes = static_cast<size_t>(packedN) * k / 2;
+  const size_t scaleBytes = static_cast<size_t>(packedN) * k / 16;
   const size_t packedBytes = codeBytes + scaleBytes;
   uint8_t* out = dest != nullptr ? dest : storage;
   const size_t outBytes = dest != nullptr ? destBytes : storageBytes;
@@ -467,10 +482,10 @@ bool Nvfp4QpnPrepareFromNative(uint8_t* storage, size_t storageBytes,
       (scaleBytes + kPrepareThreads - 1) / kPrepareThreads);
   nvfp4_qpn2_prepack_codes_from_native_kernel<<<codeBlocks, kPrepareThreads, 0,
                                                 workStream>>>(
-      codes, storage, n, k, static_cast<int>(sourceRowBytes));
+      codes, storage, packedN, n, k, static_cast<int>(sourceRowBytes));
   nvfp4_qpn2_prepack_scales_from_native_kernel<<<scaleBlocks, kPrepareThreads,
                                                  0, workStream>>>(
-      packedScales, storage, n, k, static_cast<int>(sourceRowBytes),
+      packedScales, storage, packedN, n, k, static_cast<int>(sourceRowBytes),
       globalScale);
 
   cudaError_t operationState = cudaPeekAtLastError();
