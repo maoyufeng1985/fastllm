@@ -22992,15 +22992,40 @@ namespace fastllm {
                 }();
                 if (schedTrace) {
                     static int iter = 0;
+                    // Which request was selected, and how many are in flight.
+                    // Without the identity a trace cannot tell "one request
+                    // prefilling" from "two requests rotating chunks", which
+                    // is the question this field exists to answer.
+                    int selHandle = -1;
+                    int selPreTokens = 0;
+                    int selRemaining = 0;
+                    int inFlightPrefills = 0;
+                    if (!tokenContexts.empty() && tokenContexts[0] != nullptr) {
+                        selPreTokens = tokenContexts[0]->preTokens;
+                        selRemaining = (int)tokenContexts[0]->currentTokens.size();
+                    }
+                    for (auto &orderIt : orders) {
+                        const ResponseContext *c = orderIt.context;
+                        if (c != nullptr && c->prefillRemaining > 0 &&
+                            c->preTokens > 0) {
+                            inFlightPrefills++;
+                        }
+                        if (c != nullptr && c == (tokenContexts.empty() ?
+                                nullptr : tokenContexts[0])) {
+                            selHandle = orderIt.handle;
+                        }
+                    }
                     fprintf(stderr,
                             "[sched] it=%d orders=%zu selected=%zu "
                             "isPrompt=%d selPrefillTok=%d prefillBlocked=%d "
-                            "canAddPrefill=%d forceDecode=%d actBefore=%d\n",
+                            "canAddPrefill=%d forceDecode=%d actBefore=%d "
+                            "sel=%d preTok=%d rem=%d inFlight=%d\n",
                             iter++, orders.size(), seqLens.size(),
                             (int)selectedIsPrompt, selectedPrefillTokens,
                             (int)prefillPageCapacityBlocked,
                             (int)canAddPrefill, (int)forceDecodeThisIteration,
-                            activeBeforeSelection);
+                            activeBeforeSelection, selHandle, selPreTokens,
+                            selRemaining, inFlightPrefills);
                 }
             }
 
