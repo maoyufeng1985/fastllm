@@ -22883,6 +22883,25 @@ namespace fastllm {
                 }
             }
 
+            {   // one line per scheduler iteration, opt-in
+                static const bool schedTrace = [] {
+                    const char *e = std::getenv("FASTLLM_SCHED_TRACE");
+                    return e != nullptr && e[0] != '0';
+                }();
+                if (schedTrace) {
+                    static int iter = 0;
+                    fprintf(stderr,
+                            "[sched] it=%d orders=%zu selected=%zu "
+                            "isPrompt=%d selPrefillTok=%d prefillBlocked=%d "
+                            "canAddPrefill=%d forceDecode=%d actBefore=%d\n",
+                            iter++, orders.size(), seqLens.size(),
+                            (int)selectedIsPrompt, selectedPrefillTokens,
+                            (int)prefillPageCapacityBlocked,
+                            (int)canAddPrefill, (int)forceDecodeThisIteration,
+                            activeBeforeSelection);
+                }
+            }
+
             if (!seqLens.empty()) {
                 if (selectedIsPrompt) {
                     activePrefillNeedsDecode = ShouldArmPrefillYield(
