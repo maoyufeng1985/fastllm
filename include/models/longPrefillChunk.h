@@ -105,7 +105,17 @@ inline unsigned long long NextPrefillTicket() {
     return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Test seam. The env lookup below caches on first call, so a test cannot rely
+// on setenv; it sets this instead. Unset (-1) means "follow the environment".
+inline int &PrefillRotationOverride() {
+    static int override = -1;
+    return override;
+}
+
 inline bool PrefillRotationEnabled() {
+    if (PrefillRotationOverride() >= 0) {
+        return PrefillRotationOverride() != 0;
+    }
     static const bool enabled = [] {
         const char *env = std::getenv("FASTLLM_PREFILL_ROTATE");
         return env != nullptr && env[0] != '0';

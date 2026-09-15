@@ -680,6 +680,14 @@ if (UNIT_TEST)
     add_executable(longPrefillChunkAlgebra test/ops/longPrefillChunkAlgebra.cpp)
     target_link_libraries(longPrefillChunkAlgebra fastllm)
     add_test(NAME long_prefill_chunk_algebra COMMAND longPrefillChunkAlgebra)
+    # Needs the QUASAR-NVFP4 checkpoint and 4 idle V100-16GB, so it self-skips
+    # (exit 77) when either is missing, and is labelled so the default test run
+    # can exclude it.
+    add_test(NAME prefill_rotation_split_batch
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/ops/prefillRotationSplitBatchRegression.sh)
+    set_tests_properties(prefill_rotation_split_batch PROPERTIES
+                         LABELS "gpu;needs_model"
+                         SKIP_RETURN_CODE 77)
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
         target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)

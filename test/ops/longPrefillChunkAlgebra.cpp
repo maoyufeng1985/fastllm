@@ -138,6 +138,48 @@ int main() {
             Check(LongPrefillChunkEnabled(2048), "unset env enables");
         }
 
+        {
+            // Two in-flight prefills with equal progress. Under the default
+            // ordering the ticket is ignored, so one request prefill all the
+            // way through before its peer starts.
+            auto a = MakePrompt(20000 - 2048, 2048, 20000 - 2048);
+            auto b = MakePrompt(20000 - 2048, 2048, 20000 - 2048);
+            a.prefillTicket = 7;
+            b.prefillTicket = 3;
+            PrefillRotationOverride() = 0;
+            Check(PrefillOrderSortKey(&a) == PrefillOrderSortKey(&b),
+                  "rotation off: equal progress ignores the ticket");
+
+            // Rotation on: the older ticket wins even at equal progress, so
+            // the peer gets a chunk instead of waiting out the whole prefill.
+            PrefillRotationOverride() = 1;
+            Check(PrefillOrderSortKey(&b) < PrefillOrderSortKey(&a),
+                  "rotation on: the older ticket sorts first");
+            b.prefillTicket = 8;
+            Check(PrefillOrderSortKey(&a) < PrefillOrderSortKey(&b),
+                  "rotation on: the order flips as tickets advance");
+
+            // Rotation must not touch the fresh-prompt branch.
+            auto freshLong = MakePrompt(90000);
+            auto freshShort = MakePrompt(100);
+            freshLong.prefillTicket = 9;
+            freshShort.prefillTicket = 1;
+            Check(PrefillOrderSortKey(&freshLong) < PrefillOrderSortKey(&freshShort),
+                  "fresh prompts still order by length under rotation");
+
+            // A lone in-flight prefill cannot be reordered by its ticket,
+            // because there is no peer to prefer over it.
+            auto solo = MakePrompt(80000 - 2048, 2048, 80000 - 2048);
+            solo.prefillTicket = 42;
+            Check(PrefillOrderSortKey(&solo) < PrefillOrderSortKey(&freshShort),
+                  "a lone in-flight prefill still leads every fresh prompt");
+
+            unsigned long long first = NextPrefillTicket();
+            unsigned long long second = NextPrefillTicket();
+            Check(second == first + 1, "tickets advance by one per stamp");
+            PrefillRotationOverride() = -1;
+        }
+
         printf("PASS: longPrefillChunkAlgebra\n");
         return 0;
     } catch (const std::exception &e) {
