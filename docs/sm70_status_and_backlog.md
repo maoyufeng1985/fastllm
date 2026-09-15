@@ -90,6 +90,35 @@
 | `FASTLLM_SCHED_TRACE` | off | 每轮打印调度快照（`qwen3_5.cpp:22888`），根因取证用 |
 | `FASTLLM_GPU_TOKEN_HANDOFF` | 生产 auto 开 | 决定走 `Qwen35MTPLoop` 还是 `RunNewMainLoop` |
 | `FASTLLM_PAGED_CUBLAS_CHUNK` | 8192（80K 需 2048） | 8192 在 16GB 卡上会把 QK workspace 顶到 ~1.3 GB 并挂死 |
+| `FASTLLM_PAGED_CUBLAS_LINEAR_KV_CHUNK` | 32768 | 线性 KV 路径的独立步长（`fastllm-paged-attention-native.cu:662-663`） |
+| `FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH` | off | pack32 push AR；`devices.size()==2` 写死（TP2 专属），PDL 分支需 CC≥9、V100 不可用 |
+| `FASTLLM_CUDA_CUSTOM_ALLREDUCE_FUSED_COPYBACK` | on | AR 的 fused copyback（`:133-144`） |
+
+**三个源码坑（本轮 grep 核实，行号可直接查）：**
+
+1. **空字符串算开。** `EnvEnabled()` 只把 `"0"` 当关（`qpn2_nvfp4.cu:336-338`），
+   所以 `FASTLLM_SM70_QPN=""` 仍然是开。
+2. **文档里有两个"开关"其实是编译期常量，export 没用**：
+   `FASTLLM_LONG_KV_ATTENTION_MAX_BATCH`（=32）与 `FASTLLM_PAGED_MAX_SPLITS`（=256）
+   是 `constexpr / static const`（`fastllm-attention.cu:1797`、
+   `fastllm-paged-attention-native.cu:1661`）。
+3. **"默认开"要分入口说**：CUDA Graph 的"默认开"只在 pytools 启动路径成立
+   （`util.py:317` 门槛 7.0、`:612-618` 自动注入）；裸 C++ 侧仍是
+   `include/fastllm.h:47` 的 `cudaGraph = false`（解析在 `src/fastllm.cpp:360`）。
+
+**QPN2 的形状门与边界**（代码核实）：`1 ≤ M ≤ 32`、`K % 64 == 0`、`K/16` 能被
+8/16/32 之一整除，**N 没有 %32 要求**（N-pad 侧车管的就是越过这条的那一列）；
+且 **QPN2 是 decode-only**——`M > 32` 时 `FastllmCudaTryNVFP4Qpn2` 直接返回 false
+（`fastllm-linear-fp8.cu:3675-3690`），所以 80K 行的 prefill 不走这个 kernel。
+分发顺序是 QPN2 → TurboMind → Marlin → 反量化（`fastllm-linear-fp8.cu:3956-3963`）；
+文档里写的符号 `Nvfp4QpnTry` 在代码中不存在，实际是 `FastllmCudaTryNVFP4Qpn2`。
+
+**证据等级标注**（引用任何一行前先看它是哪类）：
+
+- **[码]** 在当前基线源码里核实过（默认值、形状门、编译期常量、调用点）。
+- **[测]** 源文档记录的实测数字（运行时证据，代码无法证实/证伪）。
+- **[案]** 只是方案/设计，尚未落地。
+- **[废]** 已被后续实测推翻或更正，保留标记防止复发。
 
 （`FASTLLM_CUDA_MOE_CACHE_MAX_BATCH` 是 `fastllm-cuda.cuh:1601` 的**编译期常量** 16，
 不是 env；它同时是 MoE cache 的行数门与 `qwen4_exp.cpp:7941` 的图条件。）
@@ -173,6 +202,34 @@ fp4/fp8 走 `useFP4Tiled` / `useSm7xGqaD256Fp8` 两条 tiled 路径，dequant �
 - **QPN2 的 kernel 占比只有 clean decode 窗口能读**：全 trace 聚合会被 prefill 的
   M=2048 压过（早期"QPN2 只占 1.4%"的表就是这么来的，已作废）。
 - 生产路径走 `Qwen35MTPLoop`（handoff），不是 `RunNewMainLoop`。
+- **同一指标的多口径不要混用**：QPN2 在 8K 上有三种占比——
+  kernel 静态占比 1.4–1.5%、env A/B 的墙钟价值 **11.9%**（旧树，当前口径 23.7%）、
+  trace 桶级 41.4–55.0%。它们都对，回答的是不同问题：
+  「关掉它会退回哪条更慢的路」用 A/B；「这块在忙什么」用 trace。
+- **no-end 的 +1.1% 与 +7.9–9.6% 不是一回事**：前者是 no-end 在 AR 内部的增量，
+  后者是 custom AR（含 no-end）对 graph NCCL 的对照，口径不同。
+
+### 3.6 已落地的链路与边界（源码 + trace 对账）
+
+| 链路 | 现状 | 证据 |
+|---|---|---|
+| decode NVFP4 投影 | 256/256 全走 `nvfp4_qpn2_sm70_kernel`；窗口内无 TurboMind `gemm_kernel`、无 crop kernel | [测] `sm70_nvfp4_coverage_plan.md:12-18`。**注意**：命中数是仓库外 nsys trace 的观察，代码只能证实支撑要素（分发优先级 `fastllm-linear-fp8.cu:3956-3959`、形状门 `qpn2_nvfp4.cu:385-390`、pad 侧车后 grid=ceil(4128/32)=129、末 tile 掩码 `:316-321`）；`CropNvfp4OutputKernel` 仍在树里（`awq_sm70/fastllm-awq-sm70.cu:205`），"没有 crop"指 QPN2 全命中时 TurboMind 不跑 |
+| prefill NVFP4 | **刻意非目标**：反量化 + FP16 HMMA（cutlass h884）+ NCCL；反量化 7.37 s 全在 prefill、图内 0 | [测] `sm70_nvfp4_coverage_plan.md:73,77-80` |
+| custom AR | 128 次/token、10 KiB、图内 one-stage（16B 打包、2 CTA、双 barrier、fused copy-back）；80K decode 实测 **0 次 NCCL / 14336 次全 custom** | [测] `sm70_tp4_push_ar_plan.md:147` |
+| AR 消息尺寸随 C 变 | C=1 10 KiB、C=2 20 KiB、C=4 40 KiB、C=8 80 KiB —— 所以 C≥2 时要重新判断 40 KiB 硬切 NCCL 的归属 | [测] `sm70_1cat_port_plan.md:341-342` |
+| QPN2 形状组带宽 | gate/up 671 GB/s（grid 272）、N=5120 组 480（grid 160）、GDN-in 463（grid 129）、QKV 421（grid 112）；病因是 CTA 不足（1.4/1.6/2.0 waves） | [测] `sm70_nvfp4_coverage_plan.md:49-55` |
+| 走不到的 AR 路径 | PushAdd（TP2 专属）、PairAdd（attn 与 MLP AR 之间有数据依赖）、two-stage（门在 ≥512 KiB）、rendezvous（只在奇数 TP 构造） | [测] `sm70_ar_microbench_deepdive.md:101-104,159-161,203-204` |
+
+**并发工况的运行约束**（踩过的）：
+
+- C=2 必须 `--max_batch 4 --batch 2`（`--max_batch 2` 会卡 warmup）；
+  图预捕获 `{1, 2, 4, max}`。
+- `pagesLimit = totalPages * 4/5`（`qwen3_5.cpp:22067`），`pageLen = 128`：
+  `--tokens 16384` → 128 页需求 / 102 页限；`--tokens 32768` → 256 / 204。
+  `--tokens` 提到 32768 的代价是 **+269 MB/卡**，而 `availForKV = 1.93 GB`（≈918 页），
+  **池是配置限的，不是显存限的**。
+- 显存余量很薄：稳态 14949 / 峰值 16113 MiB，只剩 **271 MiB**。
+  所以 **C=4 长 prompt 不能叠加跑**，C=4 的 `--tokens` 要降到 49152，否则 OOM。
 
 ## 4. 待优化方向（按证据强度与收益排序）
 
@@ -319,7 +376,73 @@ prefill 证据）；Qwen4-Exp `ForwardBatch` 的 `batch==1` 断言（PR0 主体�
 - 单次 AR 的 20–69 µs 含排队，无法从 trace 分离（需 CUPTI kernel-level 或 kernel 内计时）；
   `auto-test` 里 NCCL 27.99 µs 比探针 graph 20.11 µs 高 ~8 µs，未闭合（不影响决策）。
 
-## 8. 文档地图
+## 8. 源文档之间的冲突清单（引用前先看这一节）
+
+按「是否已解决」分三组。**未裁决的两条不要私自选边**。
+
+**A. 未裁决（引用时必须两边都提）**
+
+1. **8K 并发到底摊不摊薄权重。** 同文件内三处互斥：「8K 无并发收益、C=1/2/4 全 ~87、
+   权重带宽墙」（`1cat:193-196,232-243`）vs 短 prompt C=2 **169.97 ≈ 2×C=1**
+   （`1cat:173-178`）vs `--tokens 32768` 下 **150.19（+75%）**（`1cat:206-207`）。
+   `c2ttft:26-30` 给出解释：87 持平表在 16384 池下测得、窗口只有单请求，
+   「C=2 单请求 43.6」是把 87.17 对半折算的**假设值**；t32768 每请求 ~80 tok/s、
+   步长 **13.3 ms ≈ 1.16×**，与旧「2.00× / 22.94 ms」矛盾，**二者必有一错**，
+   U0 一锤定音（`c2ttft:127-128`）。
+2. **40–512 KiB 的 AR 路由现状。** 「TP≥4 在 ≥40 KiB 无条件保留 NCCL，且图内复测
+   40/80 KiB 档 auto 实际就是硬切 NCCL」（`arb:90-92,96-101`；`dec:137-138`）
+   vs 「two-stage 门在 512 KiB，所以 40–512 KiB 现在走 custom one-stage，而 graph NCCL
+   已经更快」（`arbdd:144-146,174`）。`arbdd` 内部也自相矛盾：`:19` 判该替法
+   「graph decode 不成立」，`:26` 说「这一档仍然成立」。
+
+**B. 已更正（保留是为了防止旧值复发）**
+
+| 冲突 | 当前采信 |
+|---|---|
+| 80K KV 收益：fp4 **+4.2%** / fp8 −3.2%（`1cat:126-127`） | **fp4 −4.9% / fp8 −11.0%**；旧值错因是拿"没修 Combine 的 FP16"当基线（`1cat:160-164`） |
+| AR 成本：21.3 µs/次、2725 µs=21.4%（`arb:80-82`；`dec:23`）或 1.2–2.0 ms（`1cat:86`）或 2.6–8.8 ms / 21–63%（`arbdd:20,92-94`） | **device-0 mean 15.04 µs、AR 桶 1.925 ms = 14.3%**；`18.07 µs` 来自含 warmup 污染的工作负载，**已作废**（`push:95-103`）。小差：80K AR 桶 `1cat:310` 写 1.80 ms、`nvfp4:41` 与 `push:118` 写 1.925 ms |
+| GDN-in 逻辑 N = 2608（`1cat:94`） | **4120**，pad 到 4128（`1cat:352`；`dec:108`） |
+| GDN-in 走 QPN2 收益 ~0.57 ms / 4.5% / +5%（`arb:198`；`dec:36`） | **实测 decode +1.11%、prefill −1.43%**（`1cat:354`；`decc2:79-80`），预估高了一档 |
+| 80K attention 占比 26.2%（`1cat:123`） | **20.0%**（`1cat:263`）——Combine 修复前后，10.3% → 2.2% |
+| QPN2 形状门三种写法（`1cat:92` / `dec:120` / `nvfp4:72`） | 以源码为准：`1 ≤ M ≤ 32`、`K % 64 == 0`、`K/16` 可被 {8,16,32} 之一整除，**N 无 %32 要求**（§2.3） |
+| no-end 收益两处数字 | 不矛盾但易误读：**+1.1%** 是 no-end 在 AR 内部的增量（`arb:146-149`），**+7.9~9.6%** 是 custom AR（含 no-end）对 graph NCCL 的对照（`arbdd:225-229`） |
+| 用 53.58 tok/s 当 kernel 基线（`decc2:20`） | **口径错**（Decode-after-TTFT 被 #1 prefill 污染），不要用（`decc2:164`） |
+
+**C. 只是口径不同，不是错误**
+
+- **QPN2 占比三种**：kernel 静态 1.4–1.5%（`1cat:25`）/ A-B 墙钟 11.9%（旧树，当前
+  23.7%）/ trace busy 41.4–55.0%。问"关掉退哪条路"用 A/B，问"在忙什么"用 trace。
+- **8K C=1 decode 多值**：75.13 → 71.89 → 79.40 → 87.37 → 87.0 → 87.34，随日期与
+  口径演进；引用必须带日期与构建。
+- **8K C=1 TTFT 5.92 s（`decc2:28,36`）vs 3.16 s（`1cat:232,194`）**：条件差异
+  （构建时间、`--tokens`）未给出统一解释，**当作未闭合项**。
+- `sm70_c2_ttft_overlap_plan.md:45` 的"16284"是 **16384** 的笔误。
+
+## 9. 文档债（整合之后仍要处理）
+
+1. **两条引用的代码符号/行号对不上**（机制都在，只是指针错）：
+   `sm70_npad_ar_chunk_landing_plan.md:559` 写分发符号 `Nvfp4QpnTry`，代码里是
+   `FastllmCudaTryNVFP4Qpn2`；`sm70_long_prefill_chunk_plan.md:95` 引 `basellm.cpp`
+   让位实现的行号 1310–1337，实际在 `:1338-1352`。
+2. **`.audit/` 未入库，但文档在引用它。** 最新提交的文档引用了 `.audit/*.tsv`
+   （含 Appendix E 的 sha 锚与决策轨迹）。二选一：提交 `.audit/`，或把文档里的引用
+   统一改成「本地证据，不入库」——否则仓库内的引用是悬空的。
+3. **`sm70_npad_ar_chunk_landing_plan.md` 的 checklist 没回写。** 文件头声明三单元
+   已提交（`9647b3bd`/`fa0b6030`/`08cfe5c4`），但 16 个 `- [ ]` 里的 Merge 框仍未勾；
+   `sm70_concurrency_port_plan.md` 也有 8 个 `- [ ]`（`:674-681`）未回写。
+   引用状态时以 git log 为准，不要以勾选框为准。
+4. **旧的"计划"身份已过期**：`sm70_tp4_decode_speedup*.md` 仍把 PR-A / common window /
+   GDN-in 写成待办，而 landing plan 与 `sm70_concurrency_port_plan.md` §16 已给落地
+   结论。跨文档引用一律以 §16 与 landing plan 为准，直到把旧文档标注为历史。
+5. **口径污染的旧数字仍在源文档正文**：53.58 / 6.72 / 11 tok/s 已在表里标注，但同批
+   文档里还有别的旧值；下一轮统一加 `[废]` 或删除。
+   （另：`sm70_c2_ttft_overlap_plan.md:45` 的"16284"是 16384 的笔误。）
+
+**本文是唯一汇总入口。** 同日并行会话产生的 `sm70_status_overview.md` 与其草稿
+（`sm70_status.md`、`sm70_current_state_and_plan.md`）是同一份东西的其它版本，
+内容已并入本文（源码核实、[码] 证据等级、口径陷阱、文档债），那些文件不应再并列提交。
+
+## 10. 文档地图
 
 | 文档 | 管什么 | 状态 |
 |---|---|---|
