@@ -21731,7 +21731,11 @@ namespace fastllm {
             return needs;
         };
 
-        auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
+        // Returns the first manager whose free pages cannot cover its need,
+        // or nullptr when every need fits. Returning the manager instead of a
+        // bool is what lets the shortage diagnostic below report the same
+        // judgement the scheduler acted on, instead of recomputing it.
+        auto blockingPagedManager = [](const std::map<PagedCacheManager*, int> &needs) -> PagedCacheManager* {
             for (auto &it : needs) {
                 PagedCacheManager *manager = it.first;
                 if (manager == nullptr || it.second <= 0) {
@@ -21743,10 +21747,104 @@ namespace fastllm {
                     freePages = manager->FreePageCount();
                 }
                 if (freePages < it.second) {
-                    return true;
+                    return manager;
                 }
             }
-            return false;
+            return nullptr;
+        };
+        auto hasPagedManagerShortage = [&](const std::map<PagedCacheManager*, int> &needs) -> bool {
+            return blockingPagedManager(needs) != nullptr;
+        };
+
+        // U1 ledger. SCHED_TRACE reports that a round was blocked; this reports
+        // the five-tuple behind it, so a shortage can be classified as
+        // chunk-level or whole-prompt-level without re-deriving the judgement.
+        // Opt-in and off by default: it only runs on already-blocked rounds.
+        auto logPrefillPageShortage = [](PagedCacheManager *blocked,
+                                         const std::map<PagedCacheManager*, int> &pageNeeds,
+                                         const std::map<PagedCacheManager*, int> &combinedNeeds,
+                                         const std::map<PagedCacheManager*, int> &selectedNeeds,
+                                         const ResponseContext *ctx,
+                                         int scheduledTokens, int reserveTokens,
+                                         int pagesLimit, int pageLen) {
+            static const bool traceEnabled = [] {
+                const char *env = std::getenv("FASTLLM_SCHED_TRACE");
+                return env != nullptr && env[0] != '0';
+            }();
+            if (!traceEnabled) {
+                return;
+            }
+            int freePages = 0;
+            {
+                std::lock_guard<std::mutex> guard(blocked->pageIndexLocker);
+                freePages = blocked->FreePageCount();
+            }
+            int ownNeed = 0;
+            auto own = pageNeeds.find(blocked);
+            if (own != pageNeeds.end() && own->second > 0) {
+                ownNeed = own->second;
+            }
+            // The accumulated value for the blocking manager, read directly.
+            // Deriving it as (combinedNeed - ownNeed) cannot distinguish a real
+            // count from the INT_MAX saturation accumulated over iterations.
+            int accumulatedNeed = 0;
+            auto accumulated = combinedNeeds.find(blocked);
+            if (accumulated != combinedNeeds.end() && accumulated->second > 0) {
+                accumulatedNeed = accumulated->second;
+            }
+            const int appendTokens = scheduledTokens + reserveTokens;
+            const int currentTokens = ctx == nullptr ? 0 : (int)ctx->currentTokens.size();
+            const int preTokens = ctx == nullptr ? 0 : ctx->preTokens;
+            const int pendingChunks = ctx == nullptr ? 0 : ctx->prefillRemaining;
+            // Pages this request already holds. addExistingCache() derives its
+            // delta from exactly this, so a zero here means the whole need is
+            // being charged fresh rather than only the next chunk.
+            int ownPages = 0;
+            if (ctx != nullptr) {
+                for (const auto &layer : ctx->pastKeyValues) {
+                    for (int keyFlag = 0; keyFlag < 2; ++keyFlag) {
+                        const Data &cache = keyFlag == 0 ? layer.first : layer.second;
+                        if (cache.isPagedKVCache &&
+                            cache.pagedKVCacheData == blocked) {
+                            ownPages += (int)cache.pageIndex.size();
+                        }
+                    }
+                }
+            }
+            fprintf(stderr,
+                    "[guard] appendTok=%d reserveTok=%d ctxTok=%d preTokens=%d "
+                    "pending=%d chunk=%d | ownPages=%d needPages=%d accumulated=%d "
+                    "free=%d maxPages=%d pagesLimit=%d pageLen=%d\n",
+                    appendTokens, reserveTokens, currentTokens, preTokens,
+                    pendingChunks, appendTokens, ownPages, ownNeed,
+                    accumulatedNeed, freePages, blocked->maxPages,
+                    pagesLimit, pageLen);
+            // Per-manager breakdown. The aggregate above mixes the INT_MAX
+            // sentence with real counts, so the manager that actually blocks
+            // is only identifiable here.
+            for (const auto &it : combinedNeeds) {
+                PagedCacheManager *manager = it.first;
+                if (manager == nullptr || it.second <= 0) {
+                    continue;
+                }
+                int managerFree = 0;
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    managerFree = manager->FreePageCount();
+                }
+                int selectedForManager = 0;
+                auto selected = selectedNeeds.find(manager);
+                if (selected != selectedNeeds.end() && selected->second > 0) {
+                    selectedForManager = selected->second;
+                }
+                fprintf(stderr,
+                        "[guard-mgr] %s need=%d own=%d selected=%d free=%d "
+                        "maxPages=%d pageLen=%d%s\n",
+                        manager == blocked ? "BLOCKED" : "ok",
+                        it.second, ownNeed, selectedForManager, managerFree,
+                        manager->maxPages, manager->pageLen,
+                        it.second > manager->maxPages ? " [need>maxPages]" : "");
+            }
         };
         auto accumulatePagedManagerNeeds = [](
                 std::map<PagedCacheManager*, int> &total,
@@ -22710,12 +22808,16 @@ namespace fastllm {
                             ctx, scheduledTokens + reserveTokens);
                         auto combinedPageNeeds = selectedPrefillPageNeeds;
                         accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
-                        if (hasPagedManagerShortage(combinedPageNeeds)) {
+                        if (PagedCacheManager *blocked = blockingPagedManager(combinedPageNeeds)) {
                             // A decode request can temporarily leave too few
                             // pages to rebuild an evicted long context. Keep
                             // the prefill pending until that request releases
                             // its cache; restoring a prefix here would consume
                             // every free page and fail on the first append.
+                            logPrefillPageShortage(blocked, pageNeeds,
+                                combinedPageNeeds, selectedPrefillPageNeeds,
+                                ctx, scheduledTokens,
+                                reserveTokens, pagesLimit, pageLen);
                             prefillPageCapacityBlocked = true;
                             continue;
                         }

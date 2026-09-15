@@ -23,13 +23,42 @@
    85.83 → **150.19 tok/s（+75%）**，窗口 31 → 58 tokens（两个请求都在），
    Batch total 9.06 → 9.42。零代码。显存代价 +269 MB/卡（128 页 × 2.10 MB），
    而 `availForKV=1.93 GB` 能装 ~918 页——**页池是配置限的，从来不是显存限的**。
-4. **比 +75% 更重要的副产物：87 持平表（C=1/2/4 全 87）很可能是假象。**
+4. **比 +75% 更重要的副产物：87 持平表（C=1/2/4 全 87）是假象，已被 U0 证实。**
    那张表在 `--tokens 16384` 下测，窗口里只有单请求；"C=2 单请求 43.6"是把
    87.17 对半折算的假设值，不是实测。`t32768.out` 首次给出真正的双请求窗口：
-   每请求 ~80 tok/s（并发步长 ≈ 13.3 ms ≈ 1.16× C=1），与"权重不摊销
-   2.00×、每步 22.94 ms"的旧测量矛盾。二者必有一错，U0 一锤定音。
+   每请求 ~80 tok/s。**U0 已裁决（见 §0.5）：并发步长 ≈12.3 ms ≈ 1.07× C=1，
+   权重近似全额摊销；"不摊销 2.00× / 每步 22.94 ms"的旧测量是错的。**
 5. 执行顺序：**U0 复核实验（一锤定音）→ G1 配置落地 → U1 守卫计数器打印 →
    U2 守卫策略最小修复 → U3 让位粒度 A/B → U4 co-prefill 公平性（可选）**。
+
+## 0.5 U0 裁决行（2026-09-15，已执行）
+
+**裁决：并发步长 ≈ 12.3 ms，即 1.07× C=1，权重近似全额摊销。** 「C>1 权重不摊销」
+与「每步 22.94 ms」作废。
+
+工况 `--tokens 32768 --input_tokens 8192 --output_tokens 1024 --batch 2`，各 3 次：
+
+| 跑 | TPOP avg | common window | 其中 #0 / #1 | 逐请求速率 | sha256 |
+|---|---:|---|---|---:|---|
+| 1 | 13.78 ms | 6.35 s + 12.53 s，2042 token | 81.65 / 81.66 tok/s | ≈81.6 | `d699bcdb…` |
+| 2 | 13.79 ms | 6.35 s + 12.54 s，2042 token | 81.58 / 81.59 | ≈81.6 | `d699bcdb…` |
+| 3 | 13.82 ms | 6.37 s + 12.57 s，2042 token | 81.39 / 81.40 | ≈81.4 | `d699bcdb…` |
+
+三跑同 sha、离散 0.3% 以内。读数口径要小心两处：
+
+- **步长按"每请求 token 数"算，不是按聚合 token 数。** `Batch decode (common
+  window)` 的 163 tok/s 是两请求之和；窗口 12.53 s 里每请求各出 ~1021 个 token，
+  所以并发步长 = 12.53 s / 1021 ≈ **12.3 ms/步**，与 81.6 tok/s 自洽。
+  用 2042 去除会得到 6.1 ms，那是"每聚合 token 的时间"，不是步长。
+- **TPOP avg（13.78 ms）不是 decode 步长**，它含 prefill 相与首 token。
+
+对照：C=1 8K 是 87.0 tok/s（11.49 ms/token）。所以 C=2 每请求 81.6 对 87.0，
+单步只慢 **7%**，聚合接近翻倍。若真按 2.00× 不摊销，每步应是 ~23 ms、聚合
+~43 tok/s；实测 163，差 3.7 倍。
+
+**连带结论。** §3 的 U0 若证实 1.16× 则下调「C>1 权重不摊销是最大机会（+37%）」
+并对 `sm70_concurrency_port_plan.md` 的 53.58 回填——**该条件已满足，两条都要改**。
+另外 §0.3 的 +75% 口径不需要重写：它量的是页挂起解除，与步长独立。
 
 ## 1. 时间线还原（t16384 vs t32768，out=32/请求）
 
@@ -79,22 +108,55 @@ U0 若证实并发步长 ~1.16×（权重近似摊销），则旧结论"C>1 权�
 
 ## 4. 实施单元
 
-- **U0 复核实验（先做，一锤定音）**：`--tokens 32768`、8K C=2、out=1024
+- **U0 复核实验（已执行，2026-09-15）**：`--tokens 32768`、8K C=2、out=1024
   （对齐旧 22.94 ms 测量的工况），各 3 次。读三样：报告逐请求 in-window
-  速率；SCHED_TRACE 阻塞数（应为 0）；trace 里 C=2 并发 decode 步长。
-  **门**：并发步长落在 13–15 ms（≈1.16×）或 22–24 ms（≈2.00×）二者之一，
-  并与逐请求速率互洽；写进 §0.4 的裁决行。
-- **G1 配置落地（与 U0 并行，零风险）**：8K 档基准命令补
-  `--tokens 32768`；把 87 持平表标"16384 池、窗口单请求"的历史口径，
+  速率；SCHED_TRACE 阻塞数（应为 0）；C=2 并发 decode 步长。
+  **门命中**：步长 ≈12.3 ms（**1.07× C=1**，落在 13–15 ms 一侧的下沿），
+  与逐请求 81.6 tok/s、聚合 163 tok/s 三方互洽；三次 SCHED_TRACE 阻塞数
+  全为 **0**，sha256 全为 `d699bcdb…`。裁决行见 §0.5。
+- **G1 配置落地（已做，零风险）**：8K 档基准命令已补
+  `--tokens 32768`（见 §6）；87 持平表已在 `sm70_status_and_backlog.md` §3.3
+  与 `sm70_1cat_port_plan.md` §3 标注为"16384 池、窗口单请求"的历史口径，
   以 t32768 的逐请求分解为准。
-- **U1 守卫计数器**：阻塞发生时打印 `need/free/limit/请求长度/chunk` 五元组
-  （SCHED_TRACE 已有轮级标志，缺账本细目）。产出：确认挂起时缺的到底是
-  chunk 级还是整 prompt 级页需求。
-- **U2 守卫最小修复**：按 U1 的账本选一：`(a)` 预留只计下一 chunk +
-  decode 增长页，整 prompt 不预占；`(b)` chunk 尺寸自适应收缩到
-  `free - decodeReserve`。env `FASTLLM_PREFILL_PAGE_POLICY=strict|grow`
-  （缺省 strict=现役）。**门**：16384 池上 8K C=2 阻塞 0/72；token sha256
-  与 32768 跑逐位一致；80K/180K 工况不回退、不新增 OOM。
+- **U1 守卫计数器（已实施并实测，2026-09-15）**：`hasPagedManagerShortage` 改为
+  返回阻塞的 manager（`blockingPagedManager`），诊断从**真实判定路径**长出，
+  不复制判定；阻塞时在 `FASTLLM_SCHED_TRACE=1` 下打印账本，并按 manager 拆开。
+  已实测（16384 池、8192×2、out=32：27 次阻塞，账本每次完全相同）：
+
+  ```
+  [guard] appendTok=2049 reserveTok=1 ctxTok=2048 preTokens=6144 pending=2048
+          chunk=2049 | ownPages=48 needPages=17 accumulated=17
+          free=15 maxPages=128 pagesLimit=102 pageLen=128
+  [guard-mgr] BLOCKED need=17 own=17 selected=0 free=15 maxPages=128 pageLen=128
+  ```
+
+  **结论：不是"整 prompt 预占"，是差 2 页。** 三个数定住了：
+
+  1. `ownPages=48 + needPages=17 = 65` 页，远低于 `maxPages=128`。本请求走的是
+     **chunk 级增量**（`addExistingCache` 的 `totalPages - currentPages`），
+     方案原先怀疑的"整 prompt 预占"**在本请求身上不成立**。
+  2. 累积值 `accumulated=17` 与 `ownNeed=17` 相等，`selected=0`：**聚合里没有
+     哨兵、没有别的请求的份额**。所以阻塞判据就是 `free(15) < need(17)`，
+     差 **2 页**（= 2×128 = 256 token）。
+  3. 2 页的缺口来自 `pagesLimit = totalPages * 4 / 5` 的 80% 保守线：16384 池
+     → 128 页，限 102；8K 请求本体 64 页，两个请求 128 页 > 102。
+
+  过程更正：中间一版账本用 `combinedNeed - ownNeed` 报 `fromOthers=2159`，
+  我据此推断"H 是 INT_MAX 哨兵污染"，**那是错的**——减法在饱和值上不成立，
+  与 `selected=0` 也自相矛盾。改成**直接打印** `accumulated` 后只剩 17。
+
+  **因此 U2 的形态要重写**：不是"把整 prompt 预占改成 chunk 增量"（已经是），
+  而是"差 2 页就让一整个 prefill 停摆"这个粒度。候选见 U2 小节。
+- **U2 守卫最小修复（形态待定，U1 已改写问题）**：按 (a)/(b) 的原始假设已被
+  U1 否掉——need 本来就是 chunk 增量、聚合里也没有别的请求的份额。真实问题是
+  **`free(15) < need(17)` 这 2 页缺口让整个 prefill 停摆**。候选：
+  `(c)` 把 chunk 尺寸收缩到可用页（15 页 = 1920 token，切 1920 而非 2048），
+  即 `SelectPrefillChunkLen` 接受一个"页预算"上限；`(d)` 只对**已经开跑的
+  prefill**（`preTokens > 0`）放宽，对新建 prefill 保留 strict——理由是
+  `RequestRole::inFlightPrefill` 的注释已经承认"挡住 in-flight 会永久饿死"。
+  env `FASTLLM_PREFILL_PAGE_POLICY=strict|grow`（缺省 strict=现役）。
+  **门**：16384 池上 8K C=2 阻塞 0/72；token sha256 与 32768 跑逐位一致；
+  80K/180K 工况不回退、不新增 OOM。**这一项动的是保守守卫，需要先定 (c)/(d)。**
 - **U3 让位粒度**：PR-A 的让位从每 chunk（2048 token）改为每 N token
   （512 / 256），env 可调。**门**：8K C=2 Batch total 提升；#1 TTFT 劣化
   ≤15%；80K C=2 不回退。
@@ -124,8 +186,8 @@ FASTLLM_SCHED_TRACE=1 python3 -m ftllm.cli benchmark /home/models/Qwen3.8-27B-QU
 
 ## 7. 未验证项
 
-- 并发 decode 步长 13.3 ms（t32768 窗口隐含）vs 22.94 ms（旧 out=1024 测量）
-  的矛盾未裁决——U0。
+- ~~并发 decode 步长 13.3 ms vs 22.94 ms 未裁决~~ —— **U0 已裁决**：
+  ≈12.3 ms（1.07×），22.94 ms 作废，见 §0.5。
 - 守卫挂起时页账本的细目（缺的是 chunk 级还是整 prompt 级需求）未打印——U1。
 - U3 让位粒度的三个档位未扫。
 - U4 的 `canRunFusedBatchPrefill` 拒绝条件未梳理。
