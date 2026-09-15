@@ -329,57 +329,55 @@ inFlight 分布:  1 inFlight=4      exit=134（核心已转储）
    每卡要换 328 MB、16 层约 5.2 GB/step，几十到几百毫秒每步，而整个 decode 步
    才 12–17 ms。**加卡也会先撞 PCIe 墙。**
 
-### 3.8 那 7.37 GB/卡 的归因（2026-09-15 实测，部分结论）
+### 3.8 每卡常驻的归因（2026-09-15 实测，含一处自我更正）
 
-给启动路径加了内存检查点（`FASTLLM_MEM_TRACE=1`，见 §3.9），得到：
+给启动路径加了内存检查点（`FASTLLM_MEM_TRACE=1`）与逐缓冲转储
+（`FASTLLM_MEM_POOL_DUMP=1`）后，账目如下。
 
-| 节点 | 4 卡合计 gpuFree |
-|---|---:|
-| `AutoWarmup` 入口（权重已加载） | **43100 MB / 64576 MB** |
-| 最终 KV 标定之后 | **4110 MB / 64576 MB** |
+**权重：5.37 GB/卡。** `AutoWarmup` 入口 4 卡合计 gpuFree=43100 MB，
+`64576 − 43100 = 21476 MB`，与 20.56 GB ÷ 4 吻合（NVFP4 每参数 0.5625 字节）。
 
-**权重加载后**：`64576 − 43100 = 21476 MB` = **5.37 GB/卡**，与 20.56 GB ÷ 4 吻合
-（checkpoint 是 NVFP4，每参数 0.5625 字节）。
+**FastLLM 的大缓冲池：10.7 GB/卡，但其中可回收的只有 0.36 GB。** 逐缓冲拆分：
 
-**预热过程再吃掉约 9.7 GB/卡**，而最终建成的 KV 页池只有
-`3200 页 × 1.05 MB = 3.36 GB`。所以**其余约 6.3 GB/卡 是预热期留下的池化缓冲**。
-池统计（dev 3）印证：`bigPool: 10708/10962 MB`，即 FastLLM 自己的大缓冲池持有
-约 10.7 GB，其中页池只占 3.36 GB。
+| 项 | dev 0 | dev 3 |
+|---|---:|---:|
+| `bigPool` 总计 | 11075 MB | 10962 MB |
+| `bigBusy`（在用） | **10711 MB** | 10708 MB |
+| `bigGraphPinned` | 0 MB | 0 MB |
+| **`bigIdleUnpinned`（可回收）** | **363 MB** | **254 MB** |
 
-**这些缓冲是"缓存"而不是"丢失"**，而且有一条现成的回收路径：
+尺寸直方图（dev 0，按缓冲大小分档）：
 
-```cpp
-// fastllm-cuda.cu:4955
-static bool FastllmCudaRetryMallocAfterReleasingIdle(...) {
-    // cudaFree is forbidden while a stream is being captured.
-    if (FastllmCudaGraphIsCapturingFast()) return false;
-    // Once serving has frozen allocations, idle blocks are the reserve that
-    // future requests must reuse. Releasing them cannot make a forbidden
-    // allocation succeed and would only destroy the warmed pool.
-    if (fastllmCudaMallocDisabled) return false;
-    FastllmCudaReleaseIdleCachedBuffersForDevice(id);   // cudaFree 掉空闲缓冲
-    return FastllmCudaCheckedMalloc(...) == cudaSuccess;
-}
-```
+| 档位 | 缓冲数 | busy | idle |
+|---|---:|---:|---:|
+| ≤2 MB | 2 | 0 MB | 3 MB |
+| ≤8 MB | 149 | 641 MB | 112 MB |
+| **≤32 MB** | **396** | **6991 MB** | 215 MB |
+| ≤128 MB | 2 | 48 MB | 34 MB |
+| **>512 MB** | **2** | **3031 MB** | 0 MB |
 
-三个条件决定它会不会真的回收：
+**更正本文件初版的一处措辞。** 初版说"其余 6.3 GB 是预热期留下的池化缓冲"，
+并暗示它们是空闲缓存。**实测不成立**：池里几乎全是 `busy`，`idleUnpinned` 只有
+254–363 MB。而且初版那 7.37 GB 是拿"总显存 − 权重"倒推的，里面本来就含 KV 页池，
+所以"7.37 GB 去向不明"这个说法本身也不准确。
 
-1. **只在分配失败后触发**——先尝试、失败、才释放空闲缓冲并重试；
-2. **图捕获期禁用**（`FastllmCudaGraphIsCapturingFast`）；
-3. **分配冻结后禁用**。而冻结只在 `FASTLLM_CUDA_MEM_CHECK` 打开时生效
-   （`DisableCudaMalloc` 的守卫），**普通服务不冻结，所以路径是活的**。
+**正确的说法是**：每卡 16.93 GB ≈ 权重 5.37 GB + 大缓冲池 10.7 GB（其中 KV 页
+3.36 GB）+ 少量空闲/碎片。池里 10.7 GB 的 busy 由两部分构成——几千个页级缓冲
+（≤32 MB 档，396 个缓冲共 6991 MB，与该档平均 17.6 MB 吻合，是各层各自的页）
+和 2 个 >512 MB 的大缓冲（3031 MB，可能是打包页池或某个大工作区）。
 
-**但实测表明它回收不出足够空间**：`--tokens 500000` → 3907 页 exit 0；
-`700000 / 900000 / 1100000` → 全部 `cuda malloc failed`。也就是说即使走 OOM
-重试，空闲缓冲也放不出能装下更大池子的空间——多数大缓冲要么 `busy`，要么被
-CUDA Graph 钉住（`graphPins > 0` / `FastllmCudaGraphPoolPointerProtectedLocked`）。
+**回收路径是否存在**：存在（`FastllmCudaRetryMallocAfterReleasingIdle` →
+`ReleaseIdleCachedBuffersForDevice`，只在分配失败后触发），但**它只能放出
+0.36 GB 这个量级**，因为 `busy` 与 `graphPins > 0` 的缓冲它都不动。这解释了
+为什么 `--tokens` 从 500000 加到 700000 就直接 `cuda malloc failed`：不是回收
+没生效，而是**没有可回收的东西**。
 
-**所以结论是**：约 6.3 GB/卡 的池化缓冲里，可回收的部分已经体现在 3907 页这个
-上限里；剩下的被图钉住或仍在使用中。**逐缓冲的尺寸分布本轮没量到**（要往
-`FastllmCudaPrintPoolRejectStateLocked` 加一个按需转储），这是开放的下一步，
-也是判断"能不能再挤出 4 GB 给 4×200K"的唯一途径。
+**对 4 × 200K 的含义（本节的结论）**：那 4 GB 的缺口**不在这 10.7 GB 里**——
+它是 busy 的，不是闲着的。所以"砍掉常驻"这条路**在本轮证据下是死的**，我之前
+说它"最该查"的判断要收回。要腾出 4 GB，只有减少请求上下文、或 context parallel
+（每卡只存一部分序列，但会撞 PCIe），或者换卡。
 
-### 3.9 代码处置补充
+### 3.9 代码处置补充### 3.9 代码处置补充
 
 - **新增 `FASTLLM_MEM_TRACE=1`**（缺省关）：让启动期打印每阶段
   `cudaMemGetInfo` 与池统计。它存在的理由很具体——`verbose` 是在模型构造**之后**

@@ -4837,6 +4837,57 @@ void FastllmCudaMemPoolStats() {
            smallBusy >> 20, smallTotal >> 20, cudaBuffers.size(),
            fastllmCudaMemPoolAllocated >> 20, fastllmCudaMemPoolPeak >> 20,
            freeMem >> 20, totalMem >> 20);
+    // Per-buffer attribution, because the aggregate above cannot say how much
+    // of the cached pool could ever be handed back: a buffer that is busy or
+    // graph-pinned is permanent, an idle unpinned one is reclaimable by
+    // FastllmCudaReleaseIdleCachedBuffersForDevice. That split is exactly what
+    // decides whether a larger KV pool is reachable. Opt-in to keep the common
+    // path silent.
+    static const bool dumpBuffers = [] {
+        const char *env = std::getenv("FASTLLM_MEM_POOL_DUMP");
+        return env != nullptr && env[0] != '0';
+    }();
+    if (dumpBuffers) {
+        size_t busyBytes = 0, pinnedBytes = 0, idleBytes = 0;
+        for (auto &b : bigBuffers) {
+            if (b.busy) {
+                busyBytes += b.size;
+            } else if (b.graphPins > 0) {
+                pinnedBytes += b.size;
+            } else {
+                idleBytes += b.size;
+            }
+        }
+        printf("[CUDA_MEM_POOL_SPLIT] dev=%d bigBusy=%zu MB bigGraphPinned=%zu MB "
+               "bigIdleUnpinned=%zu MB (reclaimable)\n",
+               id, busyBytes >> 20, pinnedBytes >> 20, idleBytes >> 20);
+        // Size histogram: a KV page is 1.05 MB (FP8) and there are thousands
+        // of them, while activation scratch is a handful of tens of MB. The
+        // buckets separate the two so the busy total is attributable.
+        const size_t buckets[] = {2u << 20, 8u << 20, 32u << 20, 128u << 20,
+                                  512u << 20, (size_t)-1};
+        for (int i = 0; i < 6; i++) {
+            size_t busy = 0, idle = 0;
+            int count = 0;
+            for (auto &b : bigBuffers) {
+                if (b.size > buckets[i]) {
+                    continue;
+                }
+                if (i > 0 && b.size <= buckets[i - 1]) {
+                    continue;
+                }
+                count++;
+                if (b.busy) {
+                    busy += b.size;
+                } else {
+                    idle += b.size;
+                }
+            }
+            printf("[CUDA_MEM_POOL_BUCKET] dev=%d <=%.0fMB bufs=%d busy=%.0fMB idle=%.0fMB\n",
+                   id, buckets[i] / 1048576.0, count, busy / 1048576.0,
+                   idle / 1048576.0);
+        }
+    }
 }
 
 static bool FastllmCudaCanReusePooledBigBuffer(size_t bufferSize, size_t requestSize) {
