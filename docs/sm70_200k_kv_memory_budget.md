@@ -97,6 +97,34 @@
   180K fp4 −8.2%、fp8 −11.0%），而且 200K 上没量过；它改变数值路径，需要
   质量门。
 
+## 4.5 决定性实测：`--gpu_mem_ratio 0.98` + FP8 让 2×200K 跑通
+
+```
+--tokens 409600 --gpu_mem_ratio 0.98 --kv_cache_dtype fp8_e4m3
+--input_tokens 200000 --output_tokens 8 --batch 2
+```
+
+**exit 0，`prefillBlocked` 0 次**。预热日志：
+
+```
+reserved=0.34 GB, runtimeHeadroom=536.87 MB, servingReserve=134.22 MB,
+availForKV=3.41 GB, localKVPerPage=1.05 MB
+```
+
+对照缺省 0.90 的 `availForKV=2.05 GB`，**多出 1.36 GB，正好覆盖 §4 里 FP8 的
+缺口**。所以"2×200K 的池子装不下"这个结论**已被推翻**——缺的只是那 1.36 GB。
+
+但这一跑仍然是**串行**的：`selected=2` 只出现 1 次、TTFT 127.4 s 对 254.8 s、
+窗口里只有 #1。**内存已经够了，剩下的唯一障碍是 §3 的调度串行**
+（见 `docs/sm70_prefill_rotation_review.md`）。
+
+这条把两个问题干净地分开了：
+
+| 问题 | 状态 |
+|---|---|
+| 2×200K 的每卡显存 | **已解决**（FP8 + ratio 0.98 实测跑通）|
+| 两条 prefill 重叠 | **未解决**，且不能靠内存解决（见轮转复核）|
+
 ## 5. 还没做的事（按优先级）
 
 1. **量 `--gpu_mem_ratio` 对长上下文峰值的影响**：0.90 下 80K C=1 的
