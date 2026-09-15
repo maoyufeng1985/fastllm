@@ -1041,7 +1041,13 @@ native unpack 回归（`sm70QpnNvfp4Regression`）：
 
 ### 16.4 下一步建议
 
-1. **prefill 调度是现在并发路线的主瓶颈**，不是 kernel。80K C=2 的实测形态
+1. **prefill 调度是现在并发路线的主瓶颈**，不是 kernel。**PR-A 已实施并验证
+   （待提交）**：选批分块 + 让位已接到 `RunNewMainLoop` 与 `Qwen35MTPLoop`，
+   80K C=2 先到那条在 #1 prefill 期间产出 **40 个 decode token**（改前 ~1），
+   greedy sha256 与 `FASTLLM_LONG_PREFILL_CHUNK=0` 逐位一致，8K C=4 让位
+   12/8/4/0。PR-B（抬 `GetBatchedPrefillTokenLimit`）实测死路；PR-C 重新定性为
+   kernel 速率门，无调度缺口。详见 `docs/sm70_long_prefill_chunk_plan.md`
+   §5.1/§7/§9。80K C=2 的实测形态
    是「41.6 s 纯 prefill（期间另一条请求被完全饿死、零 decode token）+
    4.7 s 全速并发 decode（108.46 tok/s）」。8K C=4 的聚合同样被串行
    prefill 压到 47 tok/s。所以优先级高于再搬 kernel：让 chunked prefill
