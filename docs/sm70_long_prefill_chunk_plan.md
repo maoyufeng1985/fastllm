@@ -475,6 +475,28 @@ grep -n 'LongPrefillChunkEnabled\|ShouldForceDecodeThisIteration' \
   /home/fastllm/src/models/qwen3_5.cpp /home/fastllm/src/models/basellm.cpp
 ```
 
+## 8.5 C=4 与 TurboPrefill 复核（2026-09-15）
+
+**C=4 已经能叠，靠的是池子不是守卫。** `--tokens 49152 --batch 4`（8K、
+out=256）：页守卫**阻塞 0 轮**，common window **270.82 tok/s**，窗口内四条请求
+各 68.97 / 68.99 / 69.13 / 69.34 tok/s，即并发步长 ≈14.5 ms = 1.26× C=1。
+单请求基线 87.0，所以权重摊薄到 C=4 依然成立。C=2 同理（`--tokens 32768`
+→ 窗口内 80.29 / 80.89，out=1024 时步长 13.78 ms = 1.07×）。
+**结论：8K 档 C=2 用 32768、C=4 用 49152，strict 默认策略下即可，不需要改
+守卫。** 49152 也是 8K C=4 不 OOM 的实用上界。
+
+**TurboPrefill 的判定不变，且 C=4 也不改变它。** 它是 Intra-Prompt Pipeline
+Scheduling，资格门要求 `split_mode == LAYER`（层划分的多卡流水线）。本机是
+**TP4 张量并行**：每卡持有一层的一片、同一个 ubatch 四卡并行，**层与层之间
+没有流水线可填**，机制没有宿主。它也不改变 FLOPs 或 decode 速率，所以 C=4
+的 270.82 不受影响。唯一可借鉴的思想（长 prefill 分块 + 期间让位）已由 PR-A
+实现，C=4 的让位读数是 12/8/4/0。**不要为它改拓扑。**
+
+顺带否掉一条：**"chunk 按页预算收缩"（把 U2 的 (c)）实测不可行**——TTFT 能从
+18.02 s 砍到 8.63 s，但逐 token 延迟从 12.62 ms 崩到 95.69 ms（7.6 倍），
+地板从 2 提到 512 也没有改善，因为页需求对 chunk 长度是 128-token 的台阶函数。
+接线已撤除，详见 `sm70_c2_ttft_overlap_plan.md` §4 的 U2 小节。
+
 ## 9. 未验证项
 
 - **TurboPrefill（llama.cpp discussion #24092 / RFC PR #24219）已评估，不适用。**

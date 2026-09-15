@@ -141,7 +141,7 @@ ncu 做 decode 核级归因（本机两种 replay 模式分别崩 / 拿不到计
 | 80K C=1 | **73.2 tok/s** | 13.65 ms | 20.0%（17.8%） | |
 | 180K C=1 | **59.1 tok/s** | 16.93 ms | 32.9%（31.0%） | TTFT 118.98 s（prefill 1515 tok/s） |
 | 8K C=2 common window | **161.72** | — | — | AR off 149.86 |
-| 8K C=4 common window | **270.57** | — | — | 让位 12/8/4/0 保留；对照 129.27 是 QPN2-off 时代的旧值（跨源） |
+| 8K C=4 common window | **270.82** | — | — | `--tokens 49152`、`--batch 4`、out=256：**阻塞 0**，窗口内四请求各 68.97 / 68.99 / 69.13 / 69.34 tok/s（步长 ≈14.5 ms = 1.26× C=1）。同池 strict 即可，不需要改守卫 |
 | 80K C=2 common window | **115.39** | — | — | 保留 40 token 让位；零让位对照 121.90 |
 | 短 prompt 8K C=2（两请求都在 decode） | 169.97 | 11.77 ms/步 | — | C=1 89.22，几乎正好翻倍 → 权重确实被摊薄 |
 
@@ -454,7 +454,7 @@ prefill 证据）；Qwen4-Exp `ForwardBatch` 的 `batch==1` 断言（PR0 主体�
 | 文档 | 管什么 | 状态 |
 |---|---|---|
 | `sm70_1cat_port_plan.md` | 1Cat 移植总排序 + 全部杠杆判定汇总 | 主线，最新实测已回填 |
-| `sm70_c2_ttft_overlap_plan.md` | 8K C=2 TTFT 根因链与 U0–U4 | **待执行**（T1/T2） |
+| `sm70_c2_ttft_overlap_plan.md` | 8K C=2 TTFT 根因链与 U0–U4 | U0 已裁决（步长 1.07×）、U1 已实施、**U2 已实现并实测否决、代码已撤除**；G1 配置已落地（C=2 用 32768、C=4 用 49152）；U3/U4 未做 |
 | `sm70_tp4_decode_speedup_c2.md` | C=2 方案（M0 口径 / P0 分块 / P1 no-end） | M0 待补、P0 已落地、P1 随 `fa0b6030` 落地 |
 | `sm70_tp4_decode_speedup.md` | C=1 方案与「不做」清单 | D1 已落地（`fa0b6030`）、D2 已落地（`08cfe5c4`）、D3 未做 |
 | `sm70_tp4_push_ar_plan.md` | TP4 push AR 落地方案 | **暂缓**（人决策），方案保留 |
