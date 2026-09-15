@@ -92,11 +92,38 @@ poll 用 relaxed 而非 acquire 是够的：16B 包是单次 store 单 TLP 落�
 | AR 桶/token（128 次） | ~1.73 ms | 0.68–0.81 ms | 探针 × 128 |
 | decode 墙钟 | 13.16 ms（76.02 tok/s） | **12.2–12.96 ms（77.2–82.0 tok/s）** | 见下 |
 
-墙钟换算说明：skip-end 那轮 kernel 省了 ~640 µs，墙钟只兑现 150 µs
-（兑现率 23%），因为 barrier 等待被排队吸收。push 不同：省的是真实工作
-（flag RTT + 远端读轮询改本地轮询），不是等待，兑现率应显著高于 23%。
-**中心估计 +3%–4%（~0.4–0.5 ms/token，77.5–78.5 tok/s）**，区间
-+1.5%–+7.7%。上限的物理封顶：AR 桶不可能低于 128 × 5.3 µs ≈ 0.68 ms。
+**2026-09-15 复核（Combine 修复后重测）。** 引擎 AR 实测 slice，按 **device 0**
+（四卡里最慢的一卡，决定关键路径）算是 **1.925 ms/token**
+（128 × mean 15.04 µs，p50 14.88、p90 19.14、p99 26.71）。此前的
+p50 13.95 / mean 14.09 是**四卡混池**的结果：把 device 0/1/2/3 的行按时间
+交错后，较快的三卡（mean 14.03–14.22）把中位数拉低。混池对**时长**只是约 5%
+的偏差（mean 14.36 vs 15.04，p50 14.08 vs 14.88），但基准应当是 gating 的
+device 0。两份 80K trace（修复前/后）的
+device-0 时长一致（mean 15.04 / 18.08 µs），所以 15.0 µs 是稳态值；此前引用的
+18.07 µs 来自含 warmup 污染的早期工作负载，**是错的，已作废**。
+
+另一个关键量：AR 的 start-to-start 间隔**必须按 device 单独算**。四卡的行共享
+时间轴但不共享 stream，交错后得到 p50 **1.8 µs** 的假结论。per-device 的正确
+读数是 p50 **87.9 µs**（p90 237.5），即每次 AR 之后还有约 **73 µs** 的其它
+kernel（GEMM/attention/norm），AR 并不构成一段纯 AR 串行区。分布是双峰的：
+20.5% 的间隔在 60–80 µs、65.1% 在 80–100 µs、13.3% 在 200–500 µs。所以 push
+省下的时间能否暴露，取决于它落在哪一段，不能指望"把 AR 串起来跑"。
+
+AR 的绝对字节数不随上下文变，所以它的占比在三个口径下是（每行用各自 trace 的
+device-0 mean）：
+
+| 口径 | device-0 AR mean | AR 桶 | token | AR 占比 |
+|---|---:|---:|---:|---:|
+| 8K C=1 | 14.65 µs | 1.876 ms | 11.45 ms（87.4 tok/s） | **16.4%** |
+| 80K C=1 | 15.04 µs | 1.925 ms | 13.65 ms（73.2 tok/s） | **14.1%** |
+
+按探针 5.3 µs/AR 落地的上限推（各用自身 mean）：8K 省
+(14.65 − 5.3) × 128 = **1.197 ms/token** → 87.4 → 97.6 tok/s（+11.7%）；
+80K 省 (15.04 − 5.3) × 128 = **1.247 ms/token** → 73.2 → 80.6 tok/s（+10.1%）。
+这是**上限**，不是预测：skip-end 那轮 kernel 省 640 µs 只兑现 150 µs
+（23%），因为 barrier 等待被排队吸收；push 省的是真实工作（flag RTT 加远端
+读轮询改本地轮询），兑现率应显著高于 23%。**中心估计 +4%–6%。**
+上限的物理封顶：AR 桶不可能低于 128 × 5.3 µs ≈ 0.68 ms。
 
 范围之外不受益：≥40 KiB 已硬切 NCCL（two-stage 门在 512 KiB）；
 PairAdd 结构性不可行（attn AR 经 RMSNorm/gateup/swiglu/down 才到 MLP AR，
@@ -104,6 +131,21 @@ PairAdd 结构性不可行（attn AR 经 RMSNorm/gateup/swiglu/down 才到 MLP A
 其他模型（hy_v3、step3p5 等）调用仍 in-place，push 对它们休眠，零风险。
 
 代价：+320 KiB/卡显存；kernel 代码 ~200 行。
+
+## 4.1 引擎实测口径（2026-09-15，80K C=1 trace 逐 kernel 统计）
+
+`/home/nsys/dec80k_post.sqlite`，device 0，decode 窗口 1602.8 ms：
+
+- AR kernel 时长 **p50 14.88 / p90 19.14 / p99 26.71 µs**，mean 15.04；128 次/token。
+- AR 桶 **1.925 ms/token**（128 × 15.04 µs），占窗口墙钟 **13.5%**、占 busy **14.3%**。
+- AR 的 start-to-start 间隔（**per-device**）**p50 87.9 µs**（p90 237.5），即每次
+  AR 后面平均有约 73 µs 的其它 kernel（GEMM/attention/norm）。所以 AR 不构成
+  一段纯 AR 串行区，push 省下的时间是否暴露，取决于它是否落在关键路径上，而不是靠
+  "把 AR 串起来跑"。**注意**：不按 device 拆开、把四卡的行交错后算，会得到
+  p50 1.8 µs 的假"背靠背"读数（四卡共享时间轴但不共享 stream），量 headroom
+  前必须先拆卡。
+- 路由正确：整个 decode 窗口 **0 次 NCCL all-reduce**，14336 次全是 custom。
+  10 KiB 的 auto 分档在本 workload 上生效。
 
 ## 5. 实施单元（每个独立可验证）
 

@@ -123,15 +123,37 @@ cuBLAS，和另外 208 条 QPN2 投影现在的走法一致。
 | GDN-in 4120→4128 | 48 | 11,888,640 | 570,654,720 |
 | **改动后合计** | 256 | | **4.23 GB** |
 
-之前草稿写的「既有约 2.9 GB」偏低约 26%，以 3.66 GB 为准。970 MB/rank 的
-16 GB 卡上，余量要靠重启后的 `nvidia-smi` 实测确认，不能靠估算。
+之前草稿写的「既有约 2.9 GB」偏低约 26%，以 3.66 GB 为准。
 侧车走的是 `FastllmCudaMalloc` 而不是 `FastllmCudaMallocModelWeight`，绕开了
 权重 slab 的预留，也不进加载期的显存估算。这一条是既有行为，改动只是把它
 放大。
 
+**实测（2026-09-15，80K C=1，QPN2 缺省开，逐秒 `nvidia-smi` 采样 88 点，
+`/tmp/v3_mem_samples.txt`）：**
+
+| 量 | GPU0 | GPU1-3 | 对 16384 MiB 的余量 |
+|---|---:|---:|---:|
+| 稳态平台（t=40 到 85s，占绝大多数时间） | 14949 MiB | 14871 MiB | **1435 MiB（1.40 GiB）** |
+| 瞬时峰值（t=53 到 56s，warmup/capture 窗口） | **16113 MiB** | 16035 MiB | **271 MiB（0.26 GiB）** |
+
+四卡同步升降，确认不是共租户。结论：**稳态余量够，但 warmup/capture 的瞬时
+余量只有 271 MiB**，所以这张 16 GB 卡上不能叠 C=4 长 prompt，任何额外显存
+开销都可能 OOM（本轮 V2 的 C=4 尝试正是这样 OOM 的）。上面的「要靠重启后的
+`nvidia-smi` 实测确认」到此关闭。
+
 **prefill 路径变化。** GDN-in 从 TurboMind W4A16 换成 native 反量化加
 cuBLAS。这是既有 208 条投影的常态，但 GDN-in 是 48 层的最大一条，要单独量
 prefill 的 tok/s 前后对比。
+
+**实测（2026-09-15，当前二进制，同形状 QPN2 on/off 对照）：**
+
+| 场景 | QPN2 off（TurboMind GDN-in） | QPN2 on（native + cuBLAS） | 差 |
+|---|---:|---:|---:|
+| 8K C=1 prefill | 2570.30 tok/s | 2575.25 tok/s | +0.19% |
+| 80K C=1 prefill | 1993.36 tok/s | 1988.78 tok/s | −0.23% |
+
+即 prefill **不掉**（8K 略增、80K 略减，都在 0.25% 内），两个形状的 greedy
+sha256 都一样（8K C=1 `02c702ca`）。上面的「要单独量 prefill 前后对比」到此关闭。
 
 **M=9..16 的 two-row tile。** 走的是同一个 epilogue，屏蔽条件复用，测试已覆盖
 （`native_pad_m16`、`split_pad_m16`）。
