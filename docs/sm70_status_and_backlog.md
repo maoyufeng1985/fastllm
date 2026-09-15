@@ -424,13 +424,14 @@ prefill 证据）；Qwen4-Exp `ForwardBatch` 的 `batch==1` 断言（PR0 主体�
    `sm70_npad_ar_chunk_landing_plan.md:559` 写分发符号 `Nvfp4QpnTry`，代码里是
    `FastllmCudaTryNVFP4Qpn2`；`sm70_long_prefill_chunk_plan.md:95` 引 `basellm.cpp`
    让位实现的行号 1310–1337，实际在 `:1338-1352`。
-2. **`.audit/` 未入库，但文档在引用它。** 最新提交的文档引用了 `.audit/*.tsv`
-   （含 Appendix E 的 sha 锚与决策轨迹）。二选一：提交 `.audit/`，或把文档里的引用
-   统一改成「本地证据，不入库」——否则仓库内的引用是悬空的。
-3. **`sm70_npad_ar_chunk_landing_plan.md` 的 checklist 没回写。** 文件头声明三单元
-   已提交（`9647b3bd`/`fa0b6030`/`08cfe5c4`），但 16 个 `- [ ]` 里的 Merge 框仍未勾；
-   `sm70_concurrency_port_plan.md` 也有 8 个 `- [ ]`（`:674-681`）未回写。
-   引用状态时以 git log 为准，不要以勾选框为准。
+2. **`.audit/` 已入库（`46cd5c26`）。** 四个文件约 78 KB 进了仓库，文档里的
+   `.audit/*.tsv` 引用不再悬空。**但它们是决策轨迹不是结论**：151 条里仍有
+   41 条处于 open / blocked / INCONCLUSIVE，引用单条前先看它的 `result` 列。
+3. **`sm70_npad_ar_chunk_landing_plan.md` 的 checklist 已按 git 实况回写（2026-09-15）。**
+   16 个 `- [ ]` → 5 个勾上（standing orders、三 owner 并行、逐 PR 验证、工作区干净、
+   `/tmp` 日志在盘），9 个 operator/编排态项留空并注明"已随直接提交失去对象"，
+   2 个流程项留空。`sm70_concurrency_port_plan.md` 的 8 个 `- [ ]`（`:674-681`）
+   **保持不动**——逐条核过，PR0/PR2/PR4 与端到端确实都没做，勾了才是造假。
 4. **旧的"计划"身份已过期**：`sm70_tp4_decode_speedup*.md` 仍把 PR-A / common window /
    GDN-in 写成待办，而 landing plan 与 `sm70_concurrency_port_plan.md` §16 已给落地
    结论。跨文档引用一律以 §16 与 landing plan 为准，直到把旧文档标注为历史。

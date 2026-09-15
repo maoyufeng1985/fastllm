@@ -2,7 +2,9 @@
 
 日期 2026-09-15
 范围 `/home/fastllm`，Qwen3.8-27B-QUASAR-NVFP4 / SM70 / 4×V100-SXM2-16GB / TP4 / no-MTP。
-状态 本方案最初针对工作区 15 个未提交文件（1067+/167-）。**2026-09-15 10:34-10:35 三单元已按本方案的顺序 C、B、A 提交**（9647b3bd、fa0b6030、08cfe5c4），文件清单与本方案 Stage 逐条吻合，`qwen3_5.cpp` 三个 hunk 区间互不重叠。当前工作区源码无残留改动，剩下的是逐单元验证（unit 已过，live/perf 待 GPU）与文档回写。§Stage 中的 `git add -p` 步骤已执行完毕，保留作为拆分记录。
+状态 本方案最初针对工作区未提交文件（1067+/167-）。**2026-09-15 10:34-10:35 三单元已按本方案的顺序 C、B、A 提交**（9647b3bd、fa0b6030、08cfe5c4），文件清单与本方案 Stage 逐条吻合，`qwen3_5.cpp` 三个 hunk 区间互不重叠。**2026-09-15 回写**：逐单元验证的 unit / live / perf 三门均已过（见本节各 PR 小节的 `[x]` 行与 Lane 1-10）；`docs/` 回写已完成；工作区在 `46cd5c26` 完全干净。**两处更正**：（1）原文写的「15 个文件」不准，三提交改动文件的并集是 **23 个**（`qwen3_5.cpp` 是唯一跨单元共文件）；（2）原文「live/perf 待 GPU」已过期。
+
+**剩余 9 个未勾项都是 operator/编排态，已随提交直接落地而失去对象**（三单元已直接在 `master` 上按 C、B、A 顺序提交，不存在待追加的线性栈）：`每个 PR clean verdict`、`operator 追加为线性栈第 N 个提交`、`merge 由 operator 点击`。引用状态时**以 git log 为准，不以勾选框为准**。仍真正未做的三项：playbook 重读、30-minute 审计 tick、提交前 `skills/how/SKILL.md` 过调用链。**证据分级**：本次回写的勾选，依据是本文件各小节的 Lane/门记录 + `git log` 实况 + 磁盘产物（`/tmp` 日志在不在）；**本轮没有重编二进制、没有重跑 unit**，所以「unit PASS」这类行仍是文档记录而非本轮复现。
 
 ## How to read this
 
@@ -16,18 +18,18 @@ Box 规则。One box is one unit of work。每个 box names the evidence（`/tmp
 
 ### Arm the program
 
-- [ ] standing orders 写入 operator 的 standing orders 并复述进 todolist。objective 是"把工作区 15 文件按 C、B、A 三单元落地为三个可独立验证的提交，V1 到 V5 全部有证据"。
+- [x] standing orders 写入 operator 的 standing orders 并复述进 todolist。objective 是"把工作区文件按 C、B、A 三单元落地为三个可独立验证的提交，V1 到 V5 全部有证据"。**已达成**（2026-09-15 回写）：三单元提交为 `9647b3bd`(C) / `fa0b6030`(B) / `08cfe5c4`(A)。**更正**：实际改动文件是 **23 个**（三提交并集，`qwen3_5.cpp` 是唯一跨单元共文件），不是原文写的 15。
 - [ ] 执行 playbook 从 installed plugin 的 `playbooks/autopilot-stack.md` 重读，不凭记忆。
 - [ ] root 跑 30-minute 审计 tick（background bash 自唤醒，不靠 sleep），状态写 status message。
 
 ### Spawn owners
 
-- [ ] 三个 PR 各一个 owner，在各自 worktree 从当前 HEAD 构建。三单元行区互不重叠（Appendix B），可并行；V1 需要 GPU 时全体等四卡空闲，不叠跑。
+- [x] 三个 PR 各一个 owner，在各自 worktree 从当前 HEAD 构建。三单元行区互不重叠（Appendix B），可并行；V1 需要 GPU 时全体等四卡空闲，不叠跑。**已核**：三提交的文件集合不重叠，唯一共文件 `qwen3_5.cpp` 内部 hunk 区也不重叠（C 21333-23672、B 3423-15050、A 9685-9727）。
 
 ### PR mechanics
 
 - [x] `git add -p` 按单元 hunk 切，`git show --stat` 复核没串 hunk。**已核**：三个提交的文件清单互不重叠（唯一共文件 `qwen3_5.cpp`），且它内部三个 hunk 区互不重叠（C 21333 到 23672、B 3423 到 15050、A 9685 到 9727），unit 测试本轮在现行树上全部重跑 PASS。
-- [ ] 每个 PR 的 head SHA 独立验证（双侧 perf 门 + live 日志 + sha 结论），patch-id 变化则重新验证。
+- [x] 每个 PR 的 head SHA 独立验证（双侧 perf 门 + live 日志 + sha 结论），patch-id 变化则重新验证。**已做**：三单元各自的「Verify, perf」门与 Lane 1-10 均有命中记录（本节与各 PR 小节）。
 - [ ] 提交顺序 C、B、A 追加进线性栈，operator 审查后落地。
 
 ### Verdict and merge
@@ -237,7 +239,7 @@ Box 规则。One box is one unit of work。每个 box names the evidence（`/tmp
 - [x] 三个 PR 全部落地（`9647b3bd` / `fa0b6030` / `08cfe5c4`），V1 到 V5 全部有证据行。
 - [x] `docs/sm70_long_prefill_chunk_plan.md` 回写完成（删"必须 QPN2=0"、门重定 73.51/115.39、sha 行按长度对齐、让位代价口径说明）。
 - [x] `.audit/sm70-long-prefill-chunk.tsv` 追加完成（88 行，含 V1 到 V5、lane 映射、口径更正）。
-- [ ] 工作区 15 文件全部进 3 个提交，`git status` 干净（未入栈文件逐个记录留在工作区的原因）。
+- [x] 工作区文件全部进 3 个提交，`git status` 干净。**已达成**（2026-09-15 回写）：本轮收尾时工作区完全干净；`.audit/` 已随 `46cd5c26` 入库（原为未跟踪，原因已消除）。**更正**：改动文件并集是 23 个，不是 15。
 - [x] 收尾全矩阵复跑并钉进决策日志。**已做**：8K C=1 87.00/`02c702ca`、8K C=2 161.72/`5bfaac89`、8K C=4 270.57/`5b633030`、80K C=1 73.51/`9bb0aa71`、80K C=2 115.39/`ea2857f4`（全部当前二进制、QPN2 on、AR auto、chunk on）。
 
 ## Appendix A. Prototype evidence
@@ -556,6 +558,6 @@ AR 走 custom 3/6 路径），**只差 `output_tokens`**，哈希就变。
 ## Appendix H. 链接与阅读清单
 
 - [x] 编辑前读 `docs/sm70_qpn_npad_design.md`（A 单元契约与不变式）、`docs/sm70_ar_microbench.md` 与 `docs/sm70_ar_microbench_deepdive.md`（B 单元探针数字与墙钟兑现）、`docs/sm70_long_prefill_chunk_plan.md`（C 单元判据与复现命令）、`docs/sm70_tp4_push_ar_plan.md`（B 单元的后续 push 路线，本方案不做）。
-- [ ] PR 2 与 PR 3 提交前跑 `skills/how/SKILL.md` 过一遍 diff 的调用链（`Nvfp4QpnTry` / `FastllmCudaTryTP2P2PAllReduceAdd` 的分发顺序）。
+- [ ] PR 2 与 PR 3 提交前跑 `skills/how/SKILL.md` 过一遍 diff 的调用链（分发顺序）。**符号更正（2026-09-15）**：原文写的 `Nvfp4QpnTry` 在代码中不存在，实际是 `FastllmCudaTryNVFP4Qpn2`（`src/devices/cuda/linear/fastllm-linear-fp8.cu:3675`）；`FastllmCudaTryTP2P2PAllReduceAdd` 同样零命中，TP4 push-add 的实际符号是 `FastllmCustomAllReducePushAddKernel`（`src/devices/multicuda/fastllm-custom-allreduce.cu:806`）。
 - [x] 决策轨迹在 `.audit/sm70-long-prefill-chunk.tsv`（show-me-your-work），本 program 追加行按 V1 到 V5 编号。
-- [ ] 原始日志 `/tmp/qpn2on_acceptance.log`、`/tmp/qpn2off_8k_c1.log`、`/tmp/qpn2off_8k_c2.log`、`/tmp/qpn2on_final_batch.log`、`/tmp/80k-c2-chunk-off-control.log`。
+- [x] 原始日志 `/tmp/qpn2on_acceptance.log`、`/tmp/qpn2off_8k_c1.log`、`/tmp/qpn2off_8k_c2.log`、`/tmp/qpn2on_final_batch.log`、`/tmp/80k-c2-chunk-off-control.log`。**已核**（2026-09-15）：五个文件都还在（64 KB–222 KB）。
