@@ -449,3 +449,72 @@ FASTLLM_SCHED_TRACE=1 FASTLLM_PREFILL_BATCH_TOKEN_LIMIT=2048 python3 -m ftllm.cl
 保留轮转代码的理由不是"它能用"（开着自己会崩），而是**它是暴露并复现
 §3.2 那个 bug 的唯一开关**。修 bug 时需要一个能稳定触发 `inFlight=2` 的入口，
 删掉它下次还得重新实现。
+
+## 7. "10.7 GB 池子能不能瘦" 的逐项实测（2026-09-15）
+
+背景：每卡 16.93 GB 里有约 10.7 GB 落在 FastLLM 自己的大缓冲池（`bigPool`），
+而 KV 页池只占其中 3.36 GB。本轮逐项排查"能不能把这 10.7 GB 瘦下来"，
+**六条假设全部被实测挡回**。
+
+| 假设 | 探针 | 结果 |
+|---|---|---|
+| 是 KV 页池 | `--tokens 2048`（16 页）vs `409600`（3200 页）| **`bigBusy` 两者都是 10711 MB**，与 KV 池无关 |
+| 是 CUDA Graph 预留 | `FASTLLM_CUDA_GRAPH=0` | **仍 10711 MB**，与图无关 |
+| 随 batch 放大 | `--max_batch 1/2/4` | 10708 / 10711 / 10714 MB，几乎不变 |
+| 是 embedding 运行时副本 | `--cuda_embedding`（该写法未生效）| 不变 —— **这次探针无效** |
+| 空闲缓冲可回收给更大池子 | `FASTLLM_MEM_POOL_DUMP=1` | `bigIdleUnpinned` 仅 **254–363 MB** |
+| 关 CUDA embedding 省 2425 MB | `--low_gpu_mem` | **反而更糟**，见下 |
+
+### 两个大缓冲的身份
+
+一条错误信息直接指认了它：
+
+```
+FastLLM fatal CUDA allocation error: cuda malloc failed in Data::ToDevice CPU->CUDA.
+  requestBytes = 2542796800, dataType = float16,
+  dims = [248320, 5120], name = model.language_model.embed_tokens...
+```
+
+`2542796800 B = 2425.0 MB`，正是 `[vocab 248320, hidden 5120]` FP16 **未分片**的
+embedding。另一个 606.2 MB 恰好是它的 1/4，即 **TP4 分片**。也就是说每张卡上
+同时有**全量副本与 TP 分片两份**。分配点：
+
+```cpp
+// qwen3_5.cpp:16125
+if (tensorParallel && !useCpuEmbedding) {
+    PrepareMultiCudaReplicatedData(weight[language_prefix + "embed_tokens.weight"],
+                                   devices, true);   // 每卡一份全量
+}
+```
+
+`useCpuEmbedding = !GetCudaEmbeddingRequested() || GetLowMemMode()`（15276）。
+
+### 但"关掉它省 2425 MB"不成立
+
+`--low_gpu_mem` 实测把 `cuda_embedding` 关掉后：
+
+| | 权重加载后 4 卡合计 gpuFree |
+|---|---:|
+| 默认（CUDA embedding） | **43100 MB** |
+| `--low_gpu_mem`（CPU embedding） | **4032 MB** |
+
+**关掉 CUDA embedding 反而让每卡从 10.8 GB 掉到约 1.0 GB**，页池的 100 MB 分配
+（`dims=[3200,128,1,256]` FP8）直接失败。**CPU embedding 路径的代价比这份副本
+更大**，所以这条路是死的。
+
+### 结论
+
+1. 那 10.7 GB **不是浪费**：它与 KV 数量、CUDA Graph、batch 都无关，是固定的
+   **运行时工作集**，其中两个最大块是 embedding 的全量副本与 TP 分片。
+2. **可回收的只有 254–363 MB**。把它当"精简对象"没有可行入口——想省 embedding
+   副本就得走 CPU embedding，而实测那样更吃显存。
+3. 因此 4 × 200K 只能靠**减少每条请求的上下文**，或**换硬件/布局**
+   （context parallel + NVLink）。**"砍常驻"这条路本轮实测否决。**
+
+### 本轮新增的观测能力
+
+- `FASTLLM_MEM_TRACE=1`：启动期每阶段打印 `cudaMemGetInfo` 与池统计。
+  存在的理由很具体——`verbose` 在模型构造**之后**才设置，通过它看不到任何标定过程。
+- `FASTLLM_MEM_POOL_DUMP=1`：逐缓冲拆分 `busy / graphPinned / idleUnpinned`，
+  外加尺寸直方图与"按尺寸分组"（同尺寸重复 = 同一个分配点）。
+  这次正是它推翻了"池里是空闲缓存"这个说法。
