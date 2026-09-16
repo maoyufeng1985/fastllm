@@ -454,7 +454,7 @@ FASTLLM_SCHED_TRACE=1 FASTLLM_PREFILL_BATCH_TOKEN_LIMIT=2048 python3 -m ftllm.cl
 
 背景：每卡 16.93 GB 里有约 10.7 GB 落在 FastLLM 自己的大缓冲池（`bigPool`），
 而 KV 页池只占其中 3.36 GB。本轮逐项排查"能不能把这 10.7 GB 瘦下来"，
-**六条假设全部被实测挡回**。
+**六条假设里五条被实测挡回，第六条（关 CUDA embedding）当日被误判，09-16 复测翻案**。
 
 | 假设 | 探针 | 结果 |
 |---|---|---|
@@ -463,7 +463,7 @@ FASTLLM_SCHED_TRACE=1 FASTLLM_PREFILL_BATCH_TOKEN_LIMIT=2048 python3 -m ftllm.cl
 | 随 batch 放大 | `--max_batch 1/2/4` | 10708 / 10711 / 10714 MB，几乎不变 |
 | 是 embedding 运行时副本 | `--cuda_embedding`（该写法未生效）| 不变 —— **这次探针无效** |
 | 空闲缓冲可回收给更大池子 | `FASTLLM_MEM_POOL_DUMP=1` | `bigIdleUnpinned` 仅 **254–363 MB** |
-| 关 CUDA embedding 省 2425 MB | `--low_gpu_mem` | **反而更糟**，见下 |
+| 关 CUDA embedding 省 2425 MB | `--low_gpu_mem` | **成立**，每卡还回 2425 MB（09-16 复测推翻初判，见下）|
 
 ### 两个大缓冲的身份
 
@@ -489,27 +489,57 @@ if (tensorParallel && !useCpuEmbedding) {
 
 `useCpuEmbedding = !GetCudaEmbeddingRequested() || GetLowMemMode()`（15276）。
 
-### 但"关掉它省 2425 MB"不成立
+### "关掉它省 2425 MB"：09-16 复测成立，初判被推翻
 
-`--low_gpu_mem` 实测把 `cuda_embedding` 关掉后：
+09-15 首测以为这条路更糟：`--low_gpu_mem` 那跑在"权重加载后"只报 4 卡合计
+4032 MB，随后一串 `cudaErrorIllegalAddress`。09-16 在空载机器上按同一配置
+（`--tokens 409600 --max_batch 2 --batch 2 --input_tokens 8192`，开
+`FASTLLM_MEM_TRACE=1`）两臂各跑一次：
 
-| | 权重加载后 4 卡合计 gpuFree |
-|---|---:|
-| 默认（CUDA embedding） | **43100 MB** |
-| `--low_gpu_mem`（CPU embedding） | **4032 MB** |
+| 臂 | 权重加载后 gpuFree | 校准后 gpuFree | 结果 |
+|---|---:|---:|---|
+| `--cuda_embedding`（默认） | 43100 MB | 未到 | **exit=1**，暖机期 23 MB sidecar 分配 `cudaErrorMemoryAllocation` |
+| `--low_gpu_mem` | **43100 MB** | 1014 MB | **exit=0**，完整出报告（sha `076b2552…`） |
 
-**关掉 CUDA embedding 反而让每卡从 10.8 GB 掉到约 1.0 GB**，页池的 100 MB 分配
-（`dims=[3200,128,1,256]` FP8）直接失败。**CPU embedding 路径的代价比这份副本
-更大**，所以这条路是死的。
+两臂在"权重加载后"这一点**读数完全相同**（都是 43100 MB），说明该打印点落在
+embedding 副本落地**之前**，本来就看不见那 2425 MB；换句话说这个探针测不出
+`--low_gpu_mem` 的影响。旧测的 4032 MB 也因此不是这个开关造成的：那一跑与另一份
+4 卡作业（`emb_off`，08:25 起、900 s 超时后被杀）时间重叠，被占掉的约
+（43100 − 4032）/ 4 ≈ 9.8 GB/卡落进了读数；随后的崩溃是内核态 `Xid 13`
+（warp 越界地址，dmesg 08:28:37）冒出来的 `cudaErrorIllegalAddress`，不是 OOM
+（该日志里 error 700 出现 6 次，error 2 一次都没有）。
+
+结论更正：关掉 CUDA embedding **确实**把每卡 2425 MB 还回来，这条路是通的。
+
+09-16 的完整复测（每臂各两次，空载机器，8K 输入 / 64 输出 / C=1 / TP4 /
+`--tokens 16384 --max_batch 1`）：
+
+| 臂 | 每卡空闲 | availForKV | TTFT | decode | sha256 | 退出 |
+|---|---:|---:|---:|---:|---|---|
+| `--cuda_embedding` ×2 | 4.45 GB | 2.09 GB | 3155.69 / 3147.40 ms | 86.74 / 87.02 tok/s | `b960451a…` | exit 0，44–45 s |
+| `--low_gpu_mem` ×2 | 7.00 GB | 4.63 GB | 3188.43 / 3185.37 ms | 89.67 / 89.64 tok/s | `b960451a…` | exit 0，40–42 s |
+
+最干净的一行是"校准后 4 卡合计 gpuFree"：默认臂两次都是 16034 MB，
+`--low_gpu_mem` 臂两次都是 25738 MB，差 9704 MB ÷ 4 = **2426 MB/卡**，正好是那份
+未分片副本（2425 MB）。两次低显存跑的 decode 都比基线高 2.6–3.4%，TTFT 高
+1.0–1.2%，六次报告的 sha256 全同。
+
+同一个 3200 页的配置（`--tokens 409600 --max_batch 2`）在**当前构建**下方向是反的：
+默认臂两次都死在暖机期（exit=1，23 MB sidecar 分配 `cudaErrorMemoryAllocation`，
+gpuFree 只剩 19/7/21 MB），`--low_gpu_mem` 臂两次都跑完（exit=0，校准后 1014 MB，
+sha `076b2552…`）。07:12 那次默认臂是跑通的，但 `libfastllm_tools.so` 在 08:25
+重装过，两次不是同一份二进制，所以这条只作为待查项记下，不作为结论。
 
 ### 结论
 
 1. 那 10.7 GB **不是浪费**：它与 KV 数量、CUDA Graph、batch 都无关，是固定的
    **运行时工作集**，其中两个最大块是 embedding 的全量副本与 TP 分片。
-2. **可回收的只有 254–363 MB**。把它当"精简对象"没有可行入口——想省 embedding
-   副本就得走 CPU embedding，而实测那样更吃显存。
+2. **空闲缓冲可回收的只有 254–363 MB**，但 embedding 的**全量副本**
+   （2425 MB/卡）可以靠 `--low_gpu_mem` 真正拿回来——09-15 的初判被 09-16 复测
+   推翻，见上。
 3. 因此 4 × 200K 只能靠**减少每条请求的上下文**，或**换硬件/布局**
-   （context parallel + NVLink）。**"砍常驻"这条路本轮实测否决。**
+   （context parallel + NVLink）。省下这 2425 MB/卡换来的是更大的 KV 页池
+   （实测 availForKV 2.09 → 4.63 GB），不改变这个结论。
 
 ### 本轮新增的观测能力
 
