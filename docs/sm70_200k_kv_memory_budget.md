@@ -153,3 +153,35 @@ done
 
 注意别用 `--tokens 400000` 做这个测量：FP16 下池子就要 6.6 GB，会直接
 `cudaErrorMemoryAllocation`，三种 ratio 都 OOM，量不出 ratio 的效果（本轮踩过）。
+
+## 7. 还有哪些显存能挪到 CPU（2026-09-16）
+
+问题：除了已经挪走的 embedding 副本，每卡显存还有哪些能搬到主机内存。
+
+先建账。`FASTLLM_MEM_POOL_DUMP=1` 在 8K / fp8 KV / batch 1 / TP4 /
+`--low_gpu_mem` 下量（每卡 16.93 GB）：
+
+| 项 | 大小 | 性质 |
+|---|---:|---|
+| bigPool busy | **8283 MB** | 任意 chunk / KV / batch 下恒定 |
+| 其中：权重分片 | ~4.2 GB | NVFP4 64 层 + lm_head TP4 分片 606 MB + MTP ~250 MB（按 safetensors 头实算）|
+| 其中：每层固定工作缓冲 | ~3–4 GB | 64 层 × 多组缓冲，不随 prefill chunk 变（2048 / 1024 / 512 三档实测全同）|
+| 其中：小缓冲 | ~0.6–1 GB | ≤8 MB 一组 129 个 |
+| 池外 | reserved 0.34 + headroom 0.54 + serving 0.13 + sampling/graph ~0.1 GB | 预算占位与结构项 |
+| 空闲 | ~7.08 GB | |
+
+逐项判定能不能挪到 CPU：
+
+| 项 | 能挪？ | 为什么 |
+|---|---|---|
+| embedding 全量副本 2425 MB | **已挪**（`--low_gpu_mem`）| 唯一干净的 CPU offload，§6 之前已实测定案 |
+| KV 页池（4×200K 时 6.56 GB）| **不能** | Qwen3.5 GPU 路径硬断言 `!GetKVCacheInCPU()`（qwen3_5.cpp:15289）；且 CPU KV 与 FP8 KV 互斥（attentionpagedblock.cpp:117）。即使支持，每步 attention 从 CPU 读激活上下文也是灾难。真正杠杆是量化：FP8 1.05 → FP4 0.59 MB/页 |
+| 权重 ~4.2 GB/卡 | **不能** | 引擎没有"权重驻留 CPU、按需上传"的稳态路径（streaming load 只是加载期省主机 RSS，见 qwen35_streaming_load.md）。若实现，decode 每步要把整卡权重从 PCIe 拉一遍：4.2 GB ÷ ~12 GB/s ≈ 350 ms/token，对照当前 ~11 ms/token，慢约 32 倍 |
+| 每层工作缓冲 ~3–4 GB | **不能** | 每步数据；挪 CPU 意味着每个 chunk 每层都跨 PCIe 往返。实测不随 chunk 缩，减 chunk 无效 |
+| lm_head 分片 606 MB | **不能** | 每步 decode 都读（logits）|
+| MTP 层 ~250 MB | 可关 | 不开 MTP 就不加载，是关功能不是挪位置 |
+| 小项（sampling ~70 MB、graph ~2 MB、各项预留）| 不可 | 结构项 |
+
+结论：**embedding 是唯一值得挪的，已经挪完。剩下的路是压缩（FP4 KV 把池子再减半）
+和关不需要的功能（MTP），不是往 CPU 搬。** 池里那 ~3–4 GB 每层工作集是固定
+工作集，砍不动也搬不动——它是按层分配的 GPU 工作集，不是浪费。
