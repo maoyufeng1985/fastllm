@@ -238,7 +238,7 @@ PCIe 通信决定（chunk 4096 下单条 180K 实测 104.5 s，4 条约 418 s）
 | Step 1 轮转（现状代码） | **4-way 无收益**：total 559.8 vs 562.2 s 持平，均值 TTFT 350 → 418 s 变差；只有 2-way 买公平 | 2-chunk 准入上限压着 | 4-way 建议关，等 Step 3 |
 | Step 3 修 3+ chunk 崩溃 | TTFT 全收敛到 ~total（max 不变），**total 不变**，纯公平 | 崩溃根因未知，代码工作量不确定 | 未做 |
 | ~~Step 4a GEMM 换 cuBLAS~~ | **收益 0**（180K 对照 104.54 vs 104.69 s，sha 同、内核发射数逐项相等） | 已实测否掉：prefill 本来就走 dequant + cuBLAS，换枚举无差别 | 已实现、已否掉 |
-| **Step 4a′ all-reduce 藏进计算**（第三轮量化） | **上限 −35%（104.2 → 67.9 s）**，算法 = min(GEMM 39.2 s, AR 36.3 s)。可藏性三点已验：AR 达 PCIe 实用带宽 **93%**（11.64 GB/s，无可调空间）、AR 内核只占 **2 个 SM**（80 中的 2 个，与 1813 block 的 GEMM 不抢资源）、当前与 GEMM **零重叠**（同流排队） | 风险：重叠后 AR 会被抢 SM/PCIe 而变慢，真实可藏比例必须 A/B 实测。实现点已定位：`FastllmNcclAllReduceImpl`（fastllm-multicuda.cu:3099）提交在 `cudaStreamPerThread`；row-parallel 模式是 `DoCudaLinear → DoCudaLinear → FastllmNcclAllReduce`（multicudadevice.cpp:3670-3691） | 未做，可行性与上限已量清 |
+| **Step 4a′ all-reduce 藏进计算**（第四轮已实测） | **−23%（104.2 → ~80 s，省 ~24 s）**：探针实测同线程只藏 **27–28%**，换成**独立 host 线程**藏 **65–72%**（三次重复稳定）。按 2/3 算 36.3 s 里省约 24 s。上轮 −35% 的上限作废 | 关键条件是 NCCL host proxy 要有自己的推进线程，**不是**单纯换流；实现点：`FastllmNcclAllReduceImpl`（fastllm-multicuda.cu:3099）与 row-parallel 的 `DoCudaLinear→DoCudaLinear→FastllmNcclAllReduce`（multicudadevice.cpp:3670-3691）。风险：主机线程模型改动面大，需分步验证 | 未做，效果与条件已量清 |
 | **Step 4b 序列并行**（与 4a′ 同源，可叠加取其大） | AR 流量减半 → **prefill −15%，约 −63 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
 | 上下文减半（反向） | **total −50%（约 −209 s）**，最便宜 | 产品决策 | 随时可拿 |
 
