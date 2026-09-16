@@ -4861,6 +4861,32 @@ void FastllmCudaMemPoolStats() {
         printf("[CUDA_MEM_POOL_SPLIT] dev=%d bigBusy=%zu MB bigGraphPinned=%zu MB "
                "bigIdleUnpinned=%zu MB (reclaimable)\n",
                id, busyBytes >> 20, pinnedBytes >> 20, idleBytes >> 20);
+        // Group by exact size: a repeated identical size points at one
+        // allocation site, which is what makes a slimming target actionable.
+        {
+            std::map<size_t, std::pair<int, size_t> > groups;
+            for (auto &b : bigBuffers) {
+                auto &g = groups[b.size];
+                g.first++;
+                g.second += b.size;
+            }
+            std::vector<std::pair<size_t, std::pair<int, size_t> > > ordered(
+                groups.begin(), groups.end());
+            std::sort(ordered.begin(), ordered.end(),
+                      [](const std::pair<size_t, std::pair<int, size_t> > &a,
+                         const std::pair<size_t, std::pair<int, size_t> > &b) {
+                          return a.second.second > b.second.second;
+                      });
+            int shown = 0;
+            for (auto &it : ordered) {
+                if (shown++ >= 10) {
+                    break;
+                }
+                printf("[CUDA_MEM_POOL_GROUP] dev=%d size=%.3f MB count=%d total=%.1f MB\n",
+                       id, it.first / 1048576.0, it.second.first,
+                       it.second.second / 1048576.0);
+            }
+        }
         // Size histogram: a KV page is 1.05 MB (FP8) and there are thousands
         // of them, while activation scratch is a handful of tens of MB. The
         // buckets separate the two so the busy total is attributable.
