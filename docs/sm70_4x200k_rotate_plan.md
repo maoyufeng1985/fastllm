@@ -146,10 +146,28 @@ nsys 自身开销约 21%，干净跑约 83 s / 2166 tok/s）：
 - 同卡实测可达墙：cuBLAS fp16（M=4096、K=5120、tensor op、50 次平均）在
   N=512–32768 全形状 **78.5–104 TFLOPS，平台期 ~103**（`/tmp/gemmbench.cu`
   可复跑）。注意这是本机实测的可达值，不是纸面 125
-- 判定：GEMM 路径只跑到实测墙的 **23–31%**。差距里有一部分是 NVFP4 混合
-  输入的固有税（权重必须 4-bit 驻留，纯 fp16 的 13.2 GB/卡放不下），但 3–4 倍
-  远超混合输入的典型代价（好内核能到纯 fp16 的 50–70%）。80K 时那个
-  "occupancy 正常"只说明它的 tile 配置自洽，不说明配置选对了
+- 判定：GEMM 路径只跑到实测墙的 **23–31%**。80K 时那个"occupancy 正常"
+  只说明它的 tile 配置自洽，不说明配置选对了
+- **追补 2（2026-09-16）：混合输入税的说法被推翻，4a 的路比想的简单。**
+  轨迹核查：反量化内核 `FastllmCudaNVFP4Block162HalfKernel` 每卡 12288 次
+  = 44 chunk × 64 层 × 4.36、平均 170.8 us——它本来就按"层 × chunk"在跑、
+  产出 Half。即 prefill 的 GEMM（h884gemm，fp16）吃的是反量化后的 fp16
+  权重，主循环里没有 NVFP4 税。同形状 cuBLAS fp16 实测 78.5–104 TFLOPS，
+  引擎内核只有 ~24–32 TFLOPS：差距是内核配置与发射结构，不是算法极限
+
+4a 的落地路线（按性价比排序）：
+
+1. **cuBLAS 直换**（最便宜）：prefill 的 GEMM 发射改调 `cublasGemmEx`，
+   输入就是现有 fp16 workspace，形状已在 bench 里验证（78.5–104 TFLOPS）。
+   预期 GEMM busy 52.4 → ~15–17 s，prefill 墙钟 **−30%±10**。落地前先在
+   代码里确认反量化 workspace 与 GEMM 的复用关系。
+2. **fused W4A16 单内核**（省掉 2.1 s 反量化与一次 205 MB 往返）：参考
+   1Cat-vLLM 的 AWQ GEMM（`csrc/libtorch_stable/quantization/awq/
+   gemm_kernels.cu`，含 `__CUDA_ARCH__ < 750` 分支，sm70 可用）或 cutlass
+   W4A8。工程量大于路线 1，作为第二步。
+3. **D256 workspace 不适用于 GEMM**：那是 1Cat 的 attention 侧设计（GQA
+   head-dim-256 分页注意力 split+combine，`csrc/attention/sm70_v37/
+   prefill.cu`），对应的靶子是 attention 桶（12.4%），不是 GEMM 桶（46.7%）。
 - 收益上限：GEMM 路径若到墙的一半（~51 TFLOPS），GEMM busy 52.4 → 24.6 s，
   prefill 墙钟约 **−20%**
 
@@ -190,7 +208,7 @@ PCIe 通信决定（chunk 4096 下 4×180K 约 340 s）。要动这个地板只�
 | chunk 4096（Step 2） | prefill **−3.8%**，4 条约 **−13 s** | 已实测 sha 同；内存贴边但放得下 | **已采用** |
 | Step 1 轮转（现状代码） | **4-way 无收益**：total 559.8 vs 562.2 s 持平，均值 TTFT 350 → 418 s 变差；只有 2-way 买公平 | 2-chunk 准入上限压着 | 4-way 建议关，等 Step 3 |
 | Step 3 修 3+ chunk 崩溃 | TTFT 全收敛到 ~total（max 不变），**total 不变**，纯公平 | 崩溃根因未知，代码工作量不确定 | 未做 |
-| **Step 4a GEMM 路径优化** | GEMM 到实测墙一半（51 TFLOPS）→ **prefill −20%，4 条约 −68 s**；保守到墙的 35–40% → −10~13% | 混合输入内核工程（tile/主循环/换内核），sm70 无现成轮子，工作量不确定；上限受 NVFP4 固有税压制（到不了 103） | 未做，已量化 |
+| **Step 4a GEMM 换 cuBLAS** | GEMM busy 52.4 → ~15–17 s，**prefill −30%±10**（4 条约 −85~120 s） | 反量化 workspace 与 GEMM 的复用关系待代码确认；cuBLAS 形状已 bench 验证 | 未做，路线已定 |
 | **Step 4b 序列并行**（来自 NCCL 发现） | AR 流量减半 → **prefill −15%，约 −51 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
 | 上下文减半（反向） | **total −50%**，最便宜 | 产品决策 | 随时可拿 |
 
