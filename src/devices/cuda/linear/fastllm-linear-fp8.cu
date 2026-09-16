@@ -3732,6 +3732,19 @@ static bool FastllmCudaTryNVFP4Sm70TurboMind(
 
     half *cudaInput = static_cast<half *>(FastllmCudaPrepareInput(input));
     half *cudaOutput = static_cast<half *>(FastllmCudaPrepareOutput(output));
+    {
+        static std::mutex tmMutex;
+        static int tmCalls = 0;
+        static int tmPrefillCalls = 0;
+        std::lock_guard<std::mutex> guard(tmMutex);
+        tmCalls++;
+        if (n > 16) tmPrefillCalls++;
+        if (tmCalls % 2000 == 0) {
+            printf("[Fastllm] NVFP4 TurboMind GEMM calls=%d prefill(n>16)=%d (last n=%d m=%d k=%d)\n",
+                   tmCalls, tmPrefillCalls, n, m, k);
+            fflush(stdout);
+        }
+    }
     if (!fastllm::awq_sm70::GemmNvfp4(
             static_cast<const uint8_t *>(weight.cudaData), cudaInput,
             cudaOutput, n, m, k, cudaStreamPerThread)) {
@@ -3950,6 +3963,23 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
     return true;
 }
 
+// Diagnostic + isolation lever for the prefill NVFP4 GEMM, opt-in and default
+// off. Measured 2026-09-16 at 180K prompt / chunk 4096: forcing this route
+// changed nothing (same kernels, same time, same token sha256 as the default),
+// because the prefill path already reaches this dequant + cuBLAS fallback --
+// TurboMind never engages at n > 16 for this model, and on this cuBLAS version
+// CUBLAS_GEMM_DEFAULT already selects the same tensor-op cutlass kernel as
+// CUBLAS_GEMM_DEFAULT_TENSOR_OP. Kept because the per-call shape histogram it
+// prints is the tool for the open question: why the in-engine GEMM runs far
+// below the 85-95 TFLOPS that standalone cuBLAS reaches at these same shapes.
+static bool FastllmCudaNvfp4PrefillCublasEnabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("FASTLLM_NVFP4_PREFILL_CUBLAS");
+        return env != nullptr && env[0] != '0';
+    }();
+    return enabled;
+}
+
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
 
@@ -3958,12 +3988,14 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
         return true;
     }
 
-    if (FastllmCudaTryNVFP4Sm70TurboMind(
+    if (!FastllmCudaNvfp4PrefillCublasEnabled() &&
+        FastllmCudaTryNVFP4Sm70TurboMind(
             input, weight, bias, output, n, m, k)) {
         return true;
     }
 
-    if (FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+    if (!FastllmCudaNvfp4PrefillCublasEnabled() &&
+        FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
             input, weight, bias, output, n, m, k)) {
         return true;
     }
@@ -3994,6 +4026,28 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
     int dequantThreads = std::min(256, m);
+    const bool prefillCublas = FastllmCudaNvfp4PrefillCublasEnabled();
+    if (prefillCublas) {
+        static std::mutex gateMutex;
+        static std::map<std::string, int> gateShapes;
+        static int gateCalls = 0;
+        std::lock_guard<std::mutex> guard(gateMutex);
+        gateCalls++;
+        std::string key = std::to_string(n) + "x" + std::to_string(m) + "x" + std::to_string(k);
+        int &seen = gateShapes[key];
+        if (seen++ == 0 && gateShapes.size() <= 8) {
+            printf("[Fastllm] NVFP4 prefill cuBLAS path: n=%d m=%d k=%d wsBytes=%zu "
+                   "chunkRows=%d chunks=%d\n",
+                   n, m, k, wsBytes, maxRowsPerChunk,
+                   (k + maxRowsPerChunk - 1) / maxRowsPerChunk);
+            fflush(stdout);
+        }
+        if (gateCalls % 2000 == 0) {
+            printf("[Fastllm] NVFP4 prefill cuBLAS calls=%d distinctShapes=%zu\n",
+                   gateCalls, gateShapes.size());
+            fflush(stdout);
+        }
+    }
 
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
         int kc = std::min(maxRowsPerChunk, k - kOff);
@@ -4008,7 +4062,10 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
                               m, cudaInput, BType,
                               m, &h_beta,
                               cudaOutput + kOff, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                              k, ComputeType,
+                              prefillCublas
+                                  ? static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+                                  : static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error (HalfMatMulFloatNVFP4Block16).\n");
             throw("cublas error");
