@@ -38,7 +38,20 @@ namespace fastllm {
     void DeviceGetInfos(int deviceId, std::string &specialId, int &mallocType);
 
     static thread_local void *currentMultiCudaDedicatedWorker = nullptr;
-    static thread_local bool multiCudaPersistentAsyncDispatch = false;
+    // Opt-in default for the event-handoff dispatch branch. Models that opt in
+    // per-call (deepseekv4) keep their existing behaviour; everything else only
+    // takes the async path when FASTLLM_MULTICUDA_ASYNC_DISPATCH is set, so the
+    // default Qwen3.5 prefill path is unchanged unless asked.
+    static bool MultiCudaPersistentAsyncDefault() {
+        static const bool enabled = [] {
+            const char *v = std::getenv("FASTLLM_MULTICUDA_ASYNC_DISPATCH");
+            return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+                   strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        }();
+        return enabled;
+    }
+    static thread_local bool multiCudaPersistentAsyncDispatch =
+        MultiCudaPersistentAsyncDefault();
 
     static bool MultiCudaEnvFlagEnabled(const char *name) {
         const char *v = std::getenv(name);
