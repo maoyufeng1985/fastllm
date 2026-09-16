@@ -415,9 +415,96 @@ __device__ void FastllmPagedCublasSoftmaxCausalFunc(half *input, half *output, i
 }
 
 template <int THREAD_PER_BLOCK>
+__device__ void FastllmPagedCublasSoftmaxCausalOnlineFunc(half *input, half *output, int visible,
+                                                          int totalChannels, float *maxp,
+                                                          float *sump) {
+    __shared__ float sMax[THREAD_PER_BLOCK];
+    __shared__ float sSum[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    if (visible <= 0) {
+        for (int i = tid; i < totalChannels; i += THREAD_PER_BLOCK) {
+            output[i] = __float2half_rn(0.0f);
+        }
+        return;
+    }
+
+    // The production path reads the row three times (max pass, sum pass,
+    // normalize pass) for 3 reads plus 1 write plus the masked zero fill. This
+    // variant folds max and sum into one online pass, so the row is read once
+    // here and once in the normalize pass: 2 reads plus the same write and fill.
+    // exp() is still evaluated twice per element, matching the production
+    // count, because the row is not staged; the saving is the dropped read.
+    //
+    // Thread 0 alone seeds its running pair with the carried (maxp, sump) so the
+    // chunk-to-chunk merge reproduces the production formula exactly:
+    //   sump = sump * exp(maxp - maxV) + sum(exp(x - maxV))
+    // Seeding every thread would count the carried term once per thread.
+    float threadMax = tid == 0 ? maxp[0] : -1e10f;
+    float threadSum = tid == 0 ? sump[0] : 0.0f;
+    for (int i = tid; i < visible; i += THREAD_PER_BLOCK) {
+        float v = (float)input[i];
+        if (v > threadMax) {
+            threadSum = threadSum * expf(threadMax - v) + 1.0f;
+            threadMax = v;
+        } else {
+            threadSum += expf(v - threadMax);
+        }
+    }
+
+    sMax[tid] = threadMax;
+    sSum[tid] = threadSum;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float m1 = sMax[tid];
+            float m2 = sMax[tid + s];
+            float m = max(m1, m2);
+            sSum[tid] = sSum[tid] * expf(m1 - m) + sSum[tid + s] * expf(m2 - m);
+            sMax[tid] = m;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float m = sMax[0];
+        float total = sSum[0];
+        if (fabsf(total) < 1e-6f) {
+            total = 0.0001f;
+        }
+        sSum[0] = total;
+        maxp[0] = m;
+        sump[0] = total;
+    }
+    __syncthreads();
+
+    float maxV = sMax[0];
+    float invSum = 1.0f / sSum[0];
+    for (int i = tid; i < visible; i += THREAD_PER_BLOCK) {
+        output[i] = (half)(expf((float)input[i] - maxV) * invSum);
+    }
+    for (int i = visible + tid; i < totalChannels; i += THREAD_PER_BLOCK) {
+        output[i] = __float2half_rn(0.0f);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__device__ void FastllmPagedCublasSoftmaxCausalDispatch(half *input, half *output, int visible,
+                                                        int totalChannels, float *maxp,
+                                                        float *sump, int useOnline) {
+    if (useOnline) {
+        FastllmPagedCublasSoftmaxCausalOnlineFunc<THREAD_PER_BLOCK>(
+            input, output, visible, totalChannels, maxp, sump);
+        return;
+    }
+    FastllmPagedCublasSoftmaxCausalFunc<THREAD_PER_BLOCK>(
+        input, output, visible, totalChannels, maxp, sump);
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmPagedCublasSoftmaxWithCausalMask(half *input, half *output, int outer,
                                                         int channels, int base,
-                                                        float *maxp, float *sump) {
+                                                        float *maxp, float *sump,
+                                                        int useOnline) {
     int o = blockIdx.x;
     int visible = o + base + 1;
     if (visible < 0) {
@@ -426,9 +513,9 @@ __global__ void FastllmPagedCublasSoftmaxWithCausalMask(half *input, half *outpu
     if (visible > channels) {
         visible = channels;
     }
-    FastllmPagedCublasSoftmaxCausalFunc<THREAD_PER_BLOCK>(
+    FastllmPagedCublasSoftmaxCausalDispatch<THREAD_PER_BLOCK>(
         input + (size_t)o * channels, output + (size_t)o * channels, visible, channels,
-        maxp + o, sump + o);
+        maxp + o, sump + o, useOnline);
 }
 
 template <int THREAD_PER_BLOCK>
@@ -440,7 +527,8 @@ __global__ void FastllmPagedCublasSoftmaxWithGroupedCausalMask(
     int channels,
     int base,
     float *maxp,
-    float *sump) {
+    float *sump,
+    int useOnline) {
     int o = blockIdx.x;
     int queryToken = o % qoLen;
     int visible = queryToken + base + 1;
@@ -450,10 +538,10 @@ __global__ void FastllmPagedCublasSoftmaxWithGroupedCausalMask(
     if (visible > channels) {
         visible = channels;
     }
-    FastllmPagedCublasSoftmaxCausalFunc<THREAD_PER_BLOCK>(
+    FastllmPagedCublasSoftmaxCausalDispatch<THREAD_PER_BLOCK>(
         input + (size_t)o * channels,
         output + (size_t)o * channels,
-        visible, channels, maxp + o, sump + o);
+        visible, channels, maxp + o, sump + o, useOnline);
 }
 
 static size_t FastllmPagedAlignWorkspaceOffset(size_t offset) {
@@ -489,6 +577,17 @@ static int FastllmPagedCublasLinearKvChunkSizeFromEnv(int fallback) {
 static bool FastllmPagedCublasGroupedGqaEnabled() {
     const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_GROUPED_GQA");
     return env == nullptr || env[0] != '0';
+}
+
+// Opt-in: fold the causal softmax max pass and sum pass into one online pass so
+// the score row is read twice instead of three times. Default off, so the
+// production dispatch stays byte-identical until an A/B picks the variant.
+static bool FastllmPagedCublasSoftmaxOnlineEnabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("FASTLLM_PAGED_SOFTMAX_ONLINE");
+        return env != nullptr && env[0] != '0';
+    }();
+    return enabled;
 }
 
 static bool FastllmPagedCublasLinearKvEnabled() {
@@ -626,6 +725,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     const bool useGroupedGqa = FastllmPagedCublasGroupedGqaEnabled() &&
         group > 1 && group <= 8 && qoLen <= 8 && group * qoLen <= 64;
     const int groupedRows = useGroupedGqa ? group * qoLen : qoLen;
+    const int softmaxOnline = FastllmPagedCublasSoftmaxOnlineEnabled() ? 1 : 0;
 
     // Paged KV is laid out as [page, token, kv_head, dim].  For the tested
     // SM70 Qwen3.5 MTP shape, consecutive FP16 pages can be exposed directly
@@ -958,7 +1058,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 float *softmaxSum = singleChunk ? lastSum : currentSum;
                 FastllmPagedCublasSoftmaxWithGroupedCausalMask<256><<<groupedRows, 256>>>(
                     qk, qk, groupedRows, qoLen, chunkLen,
-                    kvLen - qoLen - kvStart, softmaxMax, softmaxSum);
+                    kvLen - qoLen - kvStart, softmaxMax, softmaxSum, softmaxOnline);
 
                 if (kvStart > 0) {
                     FastllmPagedCublasAttnBlockUpdateFloat<<<groupedRows, 128>>>(
@@ -1044,7 +1144,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 float *softmaxSumH = singleChunk ? lastSumH : currentSumH;
                 FastllmPagedCublasSoftmaxWithCausalMask<256><<<qoLen, 256>>>(
                     qk, qk, qoLen, chunkLen, kvLen - qoLen - kvStart,
-                    softmaxMaxH, softmaxSumH);
+                    softmaxMaxH, softmaxSumH, softmaxOnline);
 
                 if (kvStart > 0) {
                     FastllmPagedCublasAttnBlockUpdateFloat<<<qoLen, 128>>>(
