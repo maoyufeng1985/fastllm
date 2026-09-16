@@ -97,13 +97,49 @@ TTFT 从 139 s 拖到 277 s、平均值变差（350 → 418 s）。要不要这�
 
 ### Step 4. prefill 内核提速（真正的吞吐杠杆）
 
-总时长地板的唯一来源是 prefill 算力。attention 在 180K 下已占 32.9% busy
-（`sm70_1cat_port_plan.md`），且 prefill 不进 CUDA Graph，`ncu` 可以正常测
-（不像 decode 被 graph 挡住）。target：npad / chunked cublas attention 路径、
-以及"有质量的最大杠杆"AR push 系列内核。
+总时长地板的唯一来源是 prefill 算力。本节先修正两点，再动手：
 
-- 验证门：ncu 拿到 prefill 各内核耗时占比，优先打占比最大的一个，A/B 对照
-  单条 200K 的 TTFT（~127–139 s）。
+1. **测量工具是 nsys，不是 ncu。** 本机记录（.audit）已证实 ncu 的 kernel
+   replay 会撞 FastLLM 的 graph 捕获期记账（哪怕只过滤 prefill 内核，也会在
+   warmup 崩，exit 6/11）；application replay 完成但拿不到计数器。nsys
+   2026.1.3 是这台机器全程在用的工具，80K 的 prefill 归因（cutlass h884 GEMM
+   44.6%、volta FP16 GEMM 30.1%、cuBLAS paged attention 11.8%、NVFP4 反量化
+   6.7%，NCCL 另计 37%）就是从 `dec80k_post.sqlite` 用 sqlite 查询拿到的。
+2. **80K 的占比不能搬到 180K。** 16 层全注意力对增长前缀做 attention，代价
+   O(context²)；GEMM 只随 context 线性长，所以 180K 下 attention 的相对份额
+   会翻倍以上。必须按真实配置（180K prompt、chunk 4096）重新采样。另外原稿
+   写的 AR push 是 decode 侧杠杆，对 prefill 无效，移除。
+
+实测（2026-09-16，`/home/nsys/pf180k.sqlite`，180K prompt + chunk 4096 +
+200K 池 + FP8 + low_gpu_mem；nsys 下 Total 105.37 s / Prefill 1711 tok/s，
+nsys 自身开销约 21%，干净跑约 83 s / 2166 tok/s）：
+
+每卡 kernel busy 108.4 s / 118.2 s 窗口（91.8%，多流重叠）。归因（每卡）：
+
+| 内核族 | 每卡时长 | 占 busy | 说明 |
+|---|---:|---:|---|
+| **cutlass Kernel2（NVFP4 GEMM）** | **39.8 s** | **36.7%** | 253696 次发射（4 卡合计），平均 628 us |
+| NCCL AllReduce（RING_LL） | 35.8 s | 33.0% | 每卡 6656 次、平均 5.38 ms、消息 41.9 MB |
+| attention（causal softmax + update + gather） | 13.4 s | 12.4% | 80K 时占 compute 11.8%，平方增长符合预期 |
+| FP16 GEMM（s884/h884 三族） | 12.6 s | 11.6% | |
+| NVFP4 反量化 | 2.1 s | 1.9% | 80K 时 6.7%，占比下降 |
+| 其余 | ~4.7 s | ~4% | |
+
+两个判定：
+
+1. **NCCL 不是肉。** 41.9 MB 消息、5.38 ms 一次 → busbw ≈ 11.7 GB/s，已是
+   PCIe3 x16 实用峰值（~12–13 GB/s）的九成。这 33% 是 TP4 over PCIe（无
+   NVLink）的结构成本，协议、算法开关都没有可捡的；要降它只有算法级改动
+   （reduce-scatter + allgather 的序列并行，砍一半流量，预计可省 prefill
+   墙钟 ~15%）或换硬件。
+2. **单内核目标是 cutlass NVFP4 GEMM（38%）**，但 80K 时已测过该 GEMM 族
+   occupancy 正常（12.5–25%，大 tile V100 GEMM 的正常值，见
+   `sm70_1cat_port_plan.md` 5.1），赢它需要真正的 GEMM 工程（tile 形状 /
+   split-K 试验），收益不确定。
+
+**Step 4 的诚实结论：180K prefill 没有白捡的内核优化。** 地板是算力 +
+PCIe 通信；在这个机器上，最大可行杠杆仍然是上下文长度，其次是序列并行
+那种算法级重构。
 
 ### Step 5. TTFT 策略决策（轮转开还是关）
 
