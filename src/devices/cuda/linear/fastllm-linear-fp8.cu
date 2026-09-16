@@ -4095,6 +4095,114 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     return true;
 }
 
+// Folds the row-parallel residual add into the prefill GEMM: the caller's
+// `output` already holds the residual, and this accumulates weight*input into it
+// instead of writing a separate `middle` tensor and adding it afterwards.
+//
+// Measured 2026-09-16 on this engine's real prefill shape (cublas M=8704, N=4096,
+// K=5120, fp16, CUDA_R_16F accumulate, TENSOR_OP algo): beta=1 inline accumulation
+// is bitwise identical to the current (beta=0) + __hadd pair over all 35.7M
+// elements (0 differing), which is what makes this fold safe for the project's
+// token-hash gate. Dequant scratch and chunking mirror the non-fused path.
+// Opt-in switch, default off. Measured wall-clock neutral at 180K prefill
+// (103.95 s off vs 104.25 s on; device busy 108.45 vs 108.47 s): the fold does
+// remove 8576 AddTo launches (1.07 s) but the GEMM's beta=1 read+write of the
+// residual replaces exactly that traffic and the device was already saturated.
+// Kept behind the flag for A/B and for a future kernel that could also fold the
+// dequant, rather than changing the default path for no gain.
+// Set FASTLLM_NVFP4_LINEARADD=1 to enable.
+static bool FastllmCudaNvfp4LinearAddEnabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("FASTLLM_NVFP4_LINEARADD");
+        if (env == nullptr || env[0] == '\0') {
+            return false;
+        }
+        return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "off") != 0 && std::strcmp(env, "no") != 0;
+    }();
+    return enabled;
+}
+
+bool FastllmCudaHalfMatMulFloatNVFP4Block16AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k) {
+    if (!FastllmCudaNvfp4LinearAddEnabled()) {
+        return false;
+    }
+    if (input.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 &&
+         weight.dataType != fastllm::DataType::NVFP4_BLOCK_16_PLANAR)) {
+        return false;
+    }
+    // The TurboMind / marlin / QPN2 paths each need a bias argument or their own
+    // accumulation contract; keep the fold on the generic dequant + cuBLAS route.
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        return false;
+    }
+    {
+        static std::mutex statMutex;
+        static long long calls = 0;
+        static double flops = 0, bytesSaved = 0;
+        std::lock_guard<std::mutex> guard(statMutex);
+        calls++;
+        flops += 2.0 * n * m * k;
+        bytesSaved += 3.0 * n * k * 2.0;   // one r+w+r pass over the residual
+        if (calls % 2000 == 0) {
+            printf("[Fastllm] NVFP4 LinearAdd fold: calls=%lld flops=%.1f TFLOP "
+                   "residual-traffic removed=%.1f GB (last n=%d m=%d k=%d)\n",
+                   calls, flops / 1e12, bytesSaved / 1e9, n, m, k);
+            fflush(stdout);
+        }
+    }
+
+    half *cudaInput = (half *)FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half *)FastllmCudaPrepareOutput(output);
+
+    const bool planar = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_PLANAR;
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
+
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    size_t wsBytes = 0;
+    bool ownScratch = false;
+    half *cudaFp16Weight = (half *)FastllmBorrowDequantScratch(
+        (size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+    size_t bytesPerRow = (size_t)m * sizeof(half);
+    int maxRowsPerChunk =
+        (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+    const __half h_alpha = __float2half_rn(alpha);
+    const __half h_beta = __float2half_rn(overwrite ? 0.0f : 1.0f);
+    cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F,
+                 ComputeType = CUDA_R_16F;
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    int dequantThreads = std::min(256, m);
+    const bool tensorOp = FastllmCudaNvfp4PrefillCublasEnabled();
+
+    for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+        int kc = std::min(maxRowsPerChunk, k - kOff);
+        FastllmCudaNVFP4Block162HalfKernel <<< kc, dequantThreads >>>(
+            (uint8_t *)weight.cudaData, cudaFp16Weight, m, packedBytesPerRow,
+            kOff, planar);
+
+        status = cublasGemmEx(fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                              kc, n, m, &h_alpha, cudaFp16Weight, AType, m,
+                              cudaInput, BType, m, &h_beta,
+                              cudaOutput + kOff, CType, k, ComputeType,
+                              tensorOp
+                                  ? static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+                                  : static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
+            printf("Error: cublas error (HalfMatMulFloatNVFP4Block16AddTo).\n");
+            throw("cublas error");
+        }
+    }
+
+    FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
 

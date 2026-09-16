@@ -6389,6 +6389,16 @@ namespace fastllm {
                            input, weight, output, 1.0f, false, n, m, k)) {
                 // Batch-1 decode can accumulate the packed FP8 projection
                 // directly into the residual, avoiding a second AddTo launch.
+            } else if ((weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                        weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) &&
+                       bias.dims.empty() &&
+                       FastllmCudaHalfMatMulFloatNVFP4Block16AddTo(
+                           input, weight, output, 1.0f, false, n, m, k)) {
+                // Same fold for the NVFP4 (block-16) projections: accumulate the
+                // dequant + cuBLAS GEMM straight into the residual instead of
+                // writing a `middle` tensor and adding it in a second kernel.
+                // Bitwise identical to the two-step form (measured, see the
+                // implementation comment).
             } else {
                 return false;
             }
