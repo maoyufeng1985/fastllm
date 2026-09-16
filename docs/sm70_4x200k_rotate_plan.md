@@ -161,31 +161,48 @@ nsys 开销极小（同配置干净跑实测 104.54 s / 1725 tok/s，与轨迹�
   轨迹里那个 `cutlass::Kernel2<cutlass_70_tensorop_h884gemm_128x128_tn_align8>`
   是 cuBLAS 内部的内核（TurboMind 派发表里没有这些名字）。且这版 cuBLAS 上
   `CUBLAS_GEMM_DEFAULT` 与 `_TENSOR_OP` 选中同一批内核，所以换枚举无差别
-- **结论修正**：之前"引擎内核比 cuBLAS 慢 3–4 倍、换 cuBLAS 能拿 −30%"的
-  判断是**错归因**。真问题变成：引擎调的就是 cuBLAS、形状也不差，为什么
-  在引擎里只有 ~24 TFLOPS 而裸测同样形状有 85–95？当前最强假设是
-  **每次调用的分片**：180K 跑里每层每 chunk 有 ~22.5 次 GEMM 发射，明显多于
-  该层的投影数，若每次发射只覆盖一小段 token/N，则每次 GEMM 都偏小、效率掉。
-  验证工具已留在开关里（打印前 8 个形状与调用计数），下一轮做 FLOPs 统计即可
-  裁决。
+- **结论修正（第二轮实测，2026-09-16）**：上面"分片"假设与"24 TFLOPS"两个
+  说法都被推翻，实测把真问题定到了别处：
+
+  1. **没有分片**。形状直方图（开关打开时 atexit 打印）显示每次调用就是一次
+     完整投影：8K 跑 6144 次 / 5 种形状、180K 跑 49152 次 / 10 种形状，
+     `flops/call` = 60–365 GFLOP，180K 的 49152 次 = 44 chunk × 64 层 × 4.36，
+     正好是该层的投影数。
+  2. **FLOPs 必须按形状算**。180K 跑 GEMM 路径每卡 **2.39 PFLOP**
+     （4 卡合计 9564 TFLOP），除以 GEMM 内核时间 52.4 s = **45.6 TFLOPS**
+     （Kernel2 单独 61.0）。此前 24 TFLOPS 是用参数量（14.07B）估的，与引擎
+     实际发射的形状差 1.88 倍，作废。
+  3. **不是功耗墙**。同形状裸测连续 60 秒稳定 **97.3 TFLOPS**，1432 MHz、
+     243 W（上限 300 W），无降频。
+  4. **真问题是通信与计算零重叠**。device 0 上 63424 个 GEMM 内核与 NCCL
+     重叠的是 **0 个**，attention 与 NCCL 重叠也是 0 个；39.2 s GEMM +
+     36.3 s NCCL + 13.3 s attention 严格串行相加，整跑 util 91.8%、
+     空隙只有 9.7 s。也就是说 GPU 没有在计算时把 36 s 的 all-reduce 藏起来。
+
+  **所以 4a 的真靶子从"换内核"改成了"把 all-reduce 藏进计算"**：这不是
+  GEMM 内核问题，是 TP4 在 PCIe 上的调度/重叠问题。
 
 4a 的落地路线（按性价比排序）：
 
-1. **cuBLAS 直换：已实测否掉**（见上，收益 0）。保留开关只作为诊断/A-B 隔离
-   手段，不进默认路径。
-2. **fused W4A16 单内核**（省掉 2.1 s 反量化与一次 205 MB 往返）：参考
+1. **cuBLAS 直换：已实测否掉**（收益 0）。保留开关只作为诊断/A-B 隔离手段，
+   不进默认路径。
+2. **all-reduce 与 GEMM 重叠**（新的首要目标）：把 36.3 s 的 NCCL 尽量藏进
+   39.2 s 的 GEMM 背后。上限是把串行的 104 s 压到 ~68 s（−35%），实际取决于
+   能藏多少；手段是双流/分块 all-reduce（按 K 维切分 GEMM，边算边减）、
+   或 reduce-scatter + allgather 的序列并行（流量减半，见 4b）。**未做，
+   需先量可藏比例。**
+3. **fused W4A16 单内核**（省掉 2.1 s 反量化与一次 205 MB 往返）：参考
    1Cat-vLLM 的 AWQ GEMM（`csrc/libtorch_stable/quantization/awq/
    gemm_kernels.cu`，含 `__CUDA_ARCH__ < 750` 分支，sm70 可用）或 cutlass
-   W4A8。工程量大于路线 1，作为第二步。
-3. **D256 workspace 不适用于 GEMM**：那是 1Cat 的 attention 侧设计（GQA
+   W4A8。收益量级只有几秒，排在重叠之后。
+4. **D256 workspace 不适用于 GEMM**：那是 1Cat 的 attention 侧设计（GQA
    head-dim-256 分页注意力 split+combine，`csrc/attention/sm70_v37/
    prefill.cu`），对应的靶子是 attention 桶（12.4%），不是 GEMM 桶（46.7%）。
-- 收益上限：GEMM 路径若到墙的一半（~51 TFLOPS），GEMM busy 52.4 → 24.6 s，
-  prefill 墙钟约 **−20%**
 
-**Step 4 结论（修正）：** 内核侧有一个有量的目标——NVFP4 GEMM 路径（现在只跑
-到实测墙的 1/4 到 1/3），排在序列并行之前、上下文长度之后。此前"没有白捡的
-内核优化"的说法作废：occupancy 正常不等于到墙，这一条是被墙实测翻出来的。
+**Step 4 结论（第二轮修正）：** GEMM 内核本身没有 3 倍空间（45.6–61 TFLOPS
+对实测 97.3 墙，缺口主要是被串行的 NCCL 和 attention 挤出来的），真正的结构
+问题是 **all-reduce 没和计算重叠**。此前两版说法（"没有白捡的内核优化"、
+"GEMM 只跑到墙的 1/4 到 1/3"）都作废。
 
 ### Step 5. TTFT 策略决策（轮转开还是关）
 
@@ -220,8 +237,9 @@ PCIe 通信决定（chunk 4096 下单条 180K 实测 104.5 s，4 条约 418 s）
 | chunk 4096（Step 2） | prefill **−3.8%**，4 条约 **−16 s** | 已实测 sha 同；内存贴边但放得下 | **已采用** |
 | Step 1 轮转（现状代码） | **4-way 无收益**：total 559.8 vs 562.2 s 持平，均值 TTFT 350 → 418 s 变差；只有 2-way 买公平 | 2-chunk 准入上限压着 | 4-way 建议关，等 Step 3 |
 | Step 3 修 3+ chunk 崩溃 | TTFT 全收敛到 ~total（max 不变），**total 不变**，纯公平 | 崩溃根因未知，代码工作量不确定 | 未做 |
-| ~~Step 4a GEMM 换 cuBLAS~~ | **收益 0**（180K 对照 104.54 vs 104.69 s，sha 同、内核发射数逐项相等） | 已实测否掉：prefill 本来就走 dequant + cuBLAS，换枚举无差别。剩下的真问题是"引擎内 24 TFLOPS vs 裸测 85–95"，最强假设是每层 ~22.5 次 GEMM 发射的分片 | 已实现、已否掉 |
-| **Step 4b 序列并行**（来自 NCCL 发现） | AR 流量减半 → **prefill −15%，约 −63 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
+| ~~Step 4a GEMM 换 cuBLAS~~ | **收益 0**（180K 对照 104.54 vs 104.69 s，sha 同、内核发射数逐项相等） | 已实测否掉：prefill 本来就走 dequant + cuBLAS，换枚举无差别 | 已实现、已否掉 |
+| **Step 4a′ all-reduce 藏进计算**（第二轮新靶子） | **上限 −35%（104 → ~68 s）**：device 0 上 39.2 s GEMM 与 36.3 s NCCL 完全零重叠，理想全藏。实际可藏比例待测 | 双流/按 K 切分边算边减；需要先量可藏比例，改动涉及 TP 通信调度 | 未做，靶子已定 |
+| **Step 4b 序列并行**（与 4a′ 同源，可叠加取其大） | AR 流量减半 → **prefill −15%，约 −63 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
 | 上下文减半（反向） | **total −50%（约 −209 s）**，最便宜 | 产品决策 | 随时可拿 |
 
 不叠加说明：4a 与 4b 切的是同一条关键路径，合计现实预期 **−25~35%**，不是

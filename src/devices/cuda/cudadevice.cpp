@@ -6272,6 +6272,17 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
                        weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                if (CudaEnvFlagEnabled("FASTLLM_NVFP4_PREFILL_CUBLAS")) {
+                    static std::mutex nvfp4Mutex;
+                    static long long nvfp4Calls = 0;
+                    std::lock_guard<std::mutex> g(nvfp4Mutex);
+                    nvfp4Calls++;
+                    if (nvfp4Calls % 5000 == 0) {
+                        printf("[Fastllm] NVFP4_BLOCK_16 linear calls=%lld (last n=%d m=%d k=%d)\n",
+                               nvfp4Calls, n, m, k);
+                        fflush(stdout);
+                    }
+                }
                 FastllmCudaHalfMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {

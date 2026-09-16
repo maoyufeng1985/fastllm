@@ -4028,25 +4028,37 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     int dequantThreads = std::min(256, m);
     const bool prefillCublas = FastllmCudaNvfp4PrefillCublasEnabled();
     if (prefillCublas) {
+        // Shape histogram for the "why is the in-engine GEMM ~24 TFLOPS while
+        // standalone cuBLAS reaches 85-95 on the same shapes" question: the
+        // print-out is grouped by (n,m,k) with call count and FLOPs, and dumped
+        // once at exit so a single run shows the whole distribution.
         static std::mutex gateMutex;
-        static std::map<std::string, int> gateShapes;
-        static int gateCalls = 0;
+        static std::map<std::string, long long> gateCalls;
+        static std::map<std::string, double> gateFlops;
+        static bool registered = false;
         std::lock_guard<std::mutex> guard(gateMutex);
-        gateCalls++;
+        if (!registered) {
+            registered = true;
+            std::atexit([] {
+                std::lock_guard<std::mutex> g(gateMutex);
+                long long totalCalls = 0;
+                double totalFlops = 0;
+                for (auto &kv : gateCalls) totalCalls += kv.second;
+                for (auto &kv : gateFlops) totalFlops += kv.second;
+                printf("[Fastllm] NVFP4 prefill cuBLAS summary: calls=%lld flops=%.2f TFLOP\n",
+                       totalCalls, totalFlops / 1e12);
+                for (auto &kv : gateCalls) {
+                    double f = gateFlops[kv.first];
+                    printf("  %-22s calls=%6lld flops=%8.2f TFLOP  flops/call=%7.3f GFLOP\n",
+                           kv.first.c_str(), kv.second, f / 1e12,
+                           f / 1e9 / (double)kv.second);
+                }
+                fflush(stdout);
+            });
+        }
         std::string key = std::to_string(n) + "x" + std::to_string(m) + "x" + std::to_string(k);
-        int &seen = gateShapes[key];
-        if (seen++ == 0 && gateShapes.size() <= 8) {
-            printf("[Fastllm] NVFP4 prefill cuBLAS path: n=%d m=%d k=%d wsBytes=%zu "
-                   "chunkRows=%d chunks=%d\n",
-                   n, m, k, wsBytes, maxRowsPerChunk,
-                   (k + maxRowsPerChunk - 1) / maxRowsPerChunk);
-            fflush(stdout);
-        }
-        if (gateCalls % 2000 == 0) {
-            printf("[Fastllm] NVFP4 prefill cuBLAS calls=%d distinctShapes=%zu\n",
-                   gateCalls, gateShapes.size());
-            fflush(stdout);
-        }
+        gateCalls[key] += 1;
+        gateFlops[key] += 2.0 * n * m * k;
     }
 
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
