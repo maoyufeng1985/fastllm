@@ -112,7 +112,8 @@ TTFT 从 139 s 拖到 277 s、平均值变差（350 → 418 s）。要不要这�
 
 实测（2026-09-16，`/home/nsys/pf180k.sqlite`，180K prompt + chunk 4096 +
 200K 池 + FP8 + low_gpu_mem；nsys 下 Total 105.37 s / Prefill 1711 tok/s，
-nsys 自身开销约 21%，干净跑约 83 s / 2166 tok/s）：
+nsys 开销极小（同配置干净跑实测 104.54 s / 1725 tok/s，与轨迹的 105.37 s
+只差 ~1%）：
 
 每卡 kernel busy 108.4 s / 118.2 s 窗口（91.8%，多流重叠）。归因（每卡）：
 
@@ -206,22 +207,22 @@ nsys 自身开销约 21%，干净跑约 83 s / 2166 tok/s）：
 ## 5. 预期结论
 
 4×200K 已实测稳定（exit 0），TTFT 可选公平或最快，total 地板由 prefill 算力 +
-PCIe 通信决定（chunk 4096 下 4×180K 约 340 s）。要动这个地板只有 §6 收益表里
+PCIe 通信决定（chunk 4096 下单条 180K 实测 104.5 s，4 条约 418 s）。要动这个地板只有 §6 收益表里
 的三条：Step 4a、Step 4b、砍上下文。任何一步先量再动，A/B 带 sha256 校验。
 
 ## 6. 收益总表（最终收益在哪）
 
 场景：4 条 × 180K prompt、200K 池、FP8 KV、chunk 4096。基线：4 条串行 prefill
-总计 ≈ 340 s（单条 ~85 s），total 由 prefill 主导。
+总计 ≈ 418 s（单条实测 104.5 s，4 条串行），total 由 prefill 主导。
 
 | 路线 | 最终收益（数字） | 条件与风险 | 状态 |
 |---|---|---|---|
-| chunk 4096（Step 2） | prefill **−3.8%**，4 条约 **−13 s** | 已实测 sha 同；内存贴边但放得下 | **已采用** |
+| chunk 4096（Step 2） | prefill **−3.8%**，4 条约 **−16 s** | 已实测 sha 同；内存贴边但放得下 | **已采用** |
 | Step 1 轮转（现状代码） | **4-way 无收益**：total 559.8 vs 562.2 s 持平，均值 TTFT 350 → 418 s 变差；只有 2-way 买公平 | 2-chunk 准入上限压着 | 4-way 建议关，等 Step 3 |
 | Step 3 修 3+ chunk 崩溃 | TTFT 全收敛到 ~total（max 不变），**total 不变**，纯公平 | 崩溃根因未知，代码工作量不确定 | 未做 |
 | ~~Step 4a GEMM 换 cuBLAS~~ | **收益 0**（180K 对照 104.54 vs 104.69 s，sha 同、内核发射数逐项相等） | 已实测否掉：prefill 本来就走 dequant + cuBLAS，换枚举无差别。剩下的真问题是"引擎内 24 TFLOPS vs 裸测 85–95"，最强假设是每层 ~22.5 次 GEMM 发射的分片 | 已实现、已否掉 |
-| **Step 4b 序列并行**（来自 NCCL 发现） | AR 流量减半 → **prefill −15%，约 −51 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
-| 上下文减半（反向） | **total −50%**，最便宜 | 产品决策 | 随时可拿 |
+| **Step 4b 序列并行**（来自 NCCL 发现） | AR 流量减半 → **prefill −15%，约 −63 s** | reduce-scatter + allgather 大重构，动 norm/激活布局 | 未做 |
+| 上下文减半（反向） | **total −50%（约 −209 s）**，最便宜 | 产品决策 | 随时可拿 |
 
 不叠加说明：4a 与 4b 切的是同一条关键路径，合计现实预期 **−25~35%**，不是
 相加的 −35%。
