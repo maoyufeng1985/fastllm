@@ -203,7 +203,7 @@ nsys 开销极小（同配置干净跑实测 104.54 s / 1725 tok/s，与轨迹�
    不进默认路径。
 2. **all-reduce 与 GEMM 重叠：第七轮实测否掉**（详见 §6）。当时的估计是把
    36.3 s 的 NCCL 藏进 39.2 s 的 GEMM 背后、上限 104 → ~68 s（−35%）；
-   实测：依赖链下分块重叠上限只有 **14–15%**（≈5–6 s），且引擎是队列深度 1
+   第六轮记的"分块重叠上限 14–15%（≈5–6 s）"**来自合成探针，不是本引擎实测**（R1 未实现，见 §8）：该数只说明"探针里两条流能叠"，不能代表引擎。引擎实测到的是队列深度 1
    （`max_concurrent=1`），只换流拿不到任何收益，要动就得重排 TP 行并行的
    算子级流水线——5 s 的收益配不上这个改动面。
 3. **fused W4A16 单内核**（省掉 2.1 s 反量化与一次 205 MB 往返）：参考
@@ -217,12 +217,13 @@ nsys 开销极小（同配置干净跑实测 104.54 s / 1725 tok/s，与轨迹�
 
 **Step 4 结论（第七轮，最终）：** GEMM 内核本身没有 3 倍空间（45.6–61 TFLOPS
 对实测 97.3 墙，且需求侧只差 9%）；NCCL 也不是"没藏好"那么简单——引擎运行在
-**队列深度 1**（四卡各自 107 万内核同时最多 1 个在飞、重叠 0.00 s；主机每线程
-82% 时间被同步挡住）。**打开引擎已有的异步派发开关后主机同步降 92%
-（388.1 → 32.5 s），但四卡并发仍是 1、8K 墙钟不变**——所以主机阻塞不是障碍，
-设备侧单流串行才是。分块重叠（每层输出切块、AR 走独立流、两侧有可交换的独立
+**队列深度 1**（四卡各自 107 万内核同时最多 1 个在飞、重叠 0.00 s；主机 worker
+线程 86% 的时间被同步挡住）。异步派发开关对主机同步**没有可测影响**（更正见
+§8.0：文档此前写的"降 92%（388.1 → 32.5 s）"是两个不同负载相除的结果，同负载
+下开关前后同步次数逐项相等）——所以"主机阻塞不是障碍"这个结论仍然成立，但支撑
+它的那条证据作废。真因已定位到 SM70 的 per-AR 主机同步，见 §8。分块重叠（每层输出切块、AR 走独立流、两侧有可交换的独立
 工作）在理想提交模型下的上限是 **14–15%**（nsplit=8 最优，已串正确依赖），
-落到 104.2 s 上约 5–6 s，但需要重排 TP 行并行的算子级流水线。
+落到 104.2 s 上的收益**没有实测**。唯一有引擎支撑的上界是**稳态段**的设备空闲时间约 **3.1 s**（§8.3；早先记的 8.6 s 把 warmup 段算进去了，已更正），R1 只会比它小。要动就得重排 TP 行并行的算子级流水线。
 4b 的"RS+AG 流量减半"经实测为错（环上流量相同，还慢 6%）。
 此前所有版本估算（"没有白捡的内核优化"、"GEMM 只跑到墙的 1/4"、
 "−35%/−23%/−6%"）全部作废。
@@ -288,7 +289,7 @@ prefill 由算力 + PCIe 通信定调，局部优化改不动墙钟。§6 收益
 | Step 1 轮转（现状代码） | **4-way 无收益**：total 559.8 vs 562.2 s 持平，均值 TTFT 350 → 418 s 变差；只有 2-way 买公平 | 2-chunk 准入上限压着 | 4-way 建议关，等 Step 3 |
 | Step 3 修 3+ chunk 崩溃 | TTFT 全收敛到 ~total（max 不变），**total 不变**，纯公平 | 崩溃根因未知，代码工作量不确定 | 未做 |
 | ~~Step 4a GEMM 换 cuBLAS~~ | **收益 0**（180K 对照 104.54 vs 104.69 s，sha 同、内核发射数逐项相等） | 已实测否掉：prefill 本来就走 dequant + cuBLAS，换枚举无差别 | 已实现、已否掉 |
-| **Step 4a′ all-reduce 藏进计算**（第六轮，已否掉） | **不动了**：主机阻塞已证明不是障碍——打开引擎已有的异步派发开关后主机同步降 92%（388 → 32 s），但**四卡并发仍为 1、8K 墙钟不变**。设备侧根本不给并发机会：所有工作排在同一条流上，`max_concurrent=1`。要在 4×180K 上拿到分块重叠的 14–15%（≈5–6 s），得重排算子级流水线（把每层行并行拆块、NCCL 走独立流、两侧有可交换的独立工作），工作量与收益（约 5 s / 1%）严重不成比例 | 需要动 TP 行并行的算子级流水线；且 5–6 s 的收益是在 104 s 上的 ~5%，风险（数值、死锁）与回报不成比例 | **否掉，不再做** |
+| **Step 4a′ all-reduce 藏进计算**（第六轮，已否掉） | **不动了**：主机阻塞已证明不是障碍——异步派发开关开启后主机同步**无可测变化**（更正见 §8.0；原文"降 92%"是 180K/8K 两个负载相除，同负载实测开关前后 `cudaStreamSynchronize` 逐项相等），**四卡并发达不到 2、墙钟不变**。设备侧根本不给并发机会：所有工作排在同一条流上。要在 4×180K 上拿到分块重叠的收益（未测；稳态上界约 3.1 s，§8.3），得重排算子级流水线（把每层行并行拆块、NCCL 走独立流、两侧有可交换的独立工作），工作量与收益（收益未测，稳态上界约 3.1 s）严重不成比例 | 需要动 TP 行并行的算子级流水线；收益未实测（稳态上界约 3.1 s，即 104 s 的约 3%），而风险（数值、死锁）真实存在 | **否掉，不再做**；但真因（SM70 的 per-AR 主机同步）已定位，见 §8 |
 | ~~Step 4b 序列并行~~ | **前提错误，作废**：实测 RS+AG 与 all-reduce 流量**相同**（环上各 1.5S/rank），41.94 MB 下 5.874 ms vs 5.567 ms（慢 6%） | 真要减流量得按 S/n 分片激活（序列并行的完整形态），是另一种更大的重构，与"RS+AG 替换 AR"不是一回事 | 否掉 |
 | ~~残差折叠（`FASTLLM_NVFP4_LINEARADD`）~~ | **收益 0**：四臂交替 off 104.1692 vs on 104.0910 s，差 +0.078 s，仅噪声（0.437 s）的 0.18 倍；AddTo 8576→2432 次但同期 NCCL +0.95 s，设备总忙碌恒定 | 已实现、数值逐位安全（sha 全同），但工作量只是被重新分配；连同其"连反量化一起融"的延伸变体一并否掉 | 已实现、默认关、否掉 |
 | 上下文减半（反向） | **total −50%（约 −209 s）**，最便宜 | 产品决策 | 随时可拿 |
@@ -324,6 +325,11 @@ Step 4 明确**不**带来的东西：不改善 TTFT 公平（那是 Step 3/Step
 - `/tmp/overlap_dep.cu`：依赖链下四档 A/B/C/D。
 - `/tmp/fused_norm_bench.cu`：融合 add+norm 对两趟链的同形状微基准。
 - `/tmp/rsag2.cu`：all-reduce vs reduce-scatter+all-gather 的流量与时延对比。
+- `/tmp/hide2.cu`：GEMM/AR 互相隐藏的上界与依赖链形态（§8.3 主表）。
+- `/tmp/hide3.cu`：并发时 GEMM 与 AR 各自变慢多少（争用归因）。
+- `/tmp/decomp.cu`：跨卡共享 vs 单卡内部争用的分解（四卡同跑 +0.0%）。
+- `/tmp/tflops.cu`：固定窗口吞吐计数（单跑 143.7 → 并发 111.7 TFLOPS/卡）。
+- `/tmp/longconc.cu` + `/tmp/samp.sh`：长跑并发并采样功耗/时钟（排除功耗墙）。
 
 ### 构建环境（本轮装好，后续迭代受益）
 
@@ -343,3 +349,443 @@ cmake -S . -B build-sm70-tests -DUSE_CUDA=ON -DCUDA_ARCH=70 -DUNIT_TEST=ON \
 三条使用要点：`-j` 用 **10** 合适（`nproc`=10）；单个 nvcc 峰值内存仅
 0.2–0.6 GB（共 30 GB），线程数不受内存限制；**新声明尽量留在 `.cu` 内**——
 碰 `fastllm-cuda.cuh` 这类公共头会扇出 25 个编译单元（约 20 倍代价）。
+
+## 8. 复核：异步派发开关的"降 92%"是错的；并发=1 的真因（2026-09-16 追补）
+
+本节写**三件有据可查的事**：纠正 §3/§6 里那句错的引文；把并发=1 的真因定位到
+代码行；以及 **R1（分块 + AR 独立流）的引擎实测结果（§8.7）**。
+
+> 状态更新（2026-09-16 晚）：R1 **已经实现并跑通**（§8.7）。本节早先写的
+> "R1 没有实现，不给收益数字"已作废，保留在这里作为撤错留痕。
+
+### 8.0 更正："降 92%" 不成立（引擎实测）
+
+| 读数 | 值 | 来源 |
+|---|---:|---|
+| 文档里的 388.1 s | 180K prompt，`/home/nsys/pf180k.sqlite`，428 万内核 | 开关**缺席**的那份 |
+| 文档里的 32.5 s | 8K prompt，`/tmp/asy8k.sqlite`，54.8 万内核 | 开关 **ON** 的那份 |
+
+**两者是不同负载，不是开关的前后对照。** 内核数相差 7.81 倍，同步量自然相差 12 倍。
+
+同负载实测（引擎 trace）：
+
+| 场景 | `cudaStreamSynchronize` 次数 | 总阻塞 |
+|---|---:|---:|
+| 8K，`ASYNC_DISPATCH=0` | 6920 | 32.41 s |
+| 8K，`ASYNC_DISPATCH=1` | 6920 | 32.45 s |
+| 180K，flag 缺席 | 60848 | 388.14 s |
+| 180K，`ASYNC_DISPATCH=1` | 60848 | 387.57 s |
+
+**同负载下开关前后逐项相等**（差 0.04 s / 0.6 s，都在噪声内）。
+
+另一处更正：文档说"`MultiCudaSetPersistentAsyncDispatch` 仅 deepseekv4.cpp 启用、
+qwen3_5.cpp 从未启用"——**不准确**。`src/models/qwen3_5.cpp:426` 有
+`Qwen35ScopedMultiCudaAsyncDispatch` 类，`:27439` 在 MLP 路径实例化它，且该类
+**早于**加开关的提交 `c2fb222d`。
+
+**仍然成立**：四卡并发是 1（180K trace 四卡各自 `max_concurrent=1`、
+`>=2 内核在飞的时间 = 0.0000 s`）；主机 worker 线程 86% 时间被同步挡住。
+"主机阻塞不是障碍、设备侧串行才是"这个**方向对**，但支撑它的证据作废。
+
+### 8.1 并发=1 的真因（代码 + 引擎实测）
+
+1. **SM70 上每次集合通信后强制主机同步。** `fastllm-multicuda.cu:2450` 的
+   `FastllmNcclPostSyncEnabled()` 在 `FastllmCudaGetNcclForceSync()` 为真时返回真，
+   于是 `ncclAllReduce` 发射后立刻 `cudaStreamSynchronize`（`:3210`，另有三个集合
+   通信同样处理）。而 `basellm.cpp:4093` 的 warmup 收尾**按架构设门**：
+
+   ```cpp
+   if (FastllmCudaRuntimeArch() >= 75) { FastllmCudaSetNcclForceSync(false); }
+   ```
+
+   SM70（arch=70）**不满足**，所以 `ncclForceSync` 全程 `true`，每次 AR 都同步。
+   原注释写明原因：SM70 长 prefill 会在 warmup 后首次增长 chunked-attention /
+   dequant scratch，真实 `cudaMalloc` 只同步当前 GPU、排不空别的 rank 的在途
+   NCCL，会跨卡死锁。
+
+2. **GEMM 与 AR 在同一条流上。** 80K 引擎 trace device 0：stream 558 同时装着
+   FP16_GEMM 254496 次 + NCCL_AR 3456 次 + Kernel2 15592 次；两条主流的
+   **交替次数只有 1**（stream 46 在 12.05 s 结束，stream 558 从 12.41 s 才开始），
+   即"先后两段"，不是"并行两路"。
+
+**抬掉第 1 条的门（实验开关 `FASTLLM_SM70_NCCL_ASYNC=1`，见 §8.4），引擎实测：**
+
+| 场景 | 同步次数 | 总阻塞 | `max_concurrent` | 墙钟 | sha256 |
+|---|---:|---:|---:|---:|---|
+| 80K，门保持 | 23120 | 152.87 s | 1（四卡） | 38.1410 s | `1d23759c` |
+| 80K，`SM70_NCCL_ASYNC=1` | **12800（−45%）** | **82.06 s（−46%）** | **仍 1** | 38.2326 s | `1d23759c` |
+
+**同步腰斩，但并发仍 1、墙钟不动。** 第 1 条是必要不充分：次数降下来了，
+GEMM 和 AR 还在同一条流上排队。**降主机阻塞 ≠ 买并发。**
+
+### 8.2 收益表（R1 已实现并实测，收益为**负**；R5 已判定**不该做**）
+
+单位统一为 80K prompt（`--input_tokens 80000 --output_tokens 8`），四张 V100、TP4、
+`FASTLLM_QWEN35_SM70_CUDA_GRAPH=0`，同一台机器同一时段串行跑。五次运行 sha256 全部
+为 `1d23759c`：
+
+| 配置 | Total | Prefill | 相对对照 |
+|---|---:|---:|---:|
+| 对照（不开 R1） | 37.3322 s | 2151.76 tok/s | — |
+| R2：AR 放独立流、不分块 | 39.9610 s | 2009.59 tok/s | **+7.04%** |
+| R2 + 还原 host drain（`FASTLLM_TP_AR_SIDE_STREAM_HOST_SYNC=1`） | 38.2152 s | 2101.80 tok/s | **+2.37%** |
+| R1：AR 独立流 + `nsplit=4` 分块流水 | 39.3311 s | 2041.97 tok/s | **+5.35%** |
+| R1 + 还原 host drain | 39.4692 s | 2034.73 tok/s | **+5.72%** |
+
+**R2 那 7 个点拆开了**（这也是本节前一版写错的地方，见下面的撤错）：
+还原每个集合通信后的 host drain，就把 **7.04 点里的 4.37 点**拿回来
+（39.9610 → 38.2152）。剩下 **2.37 点**才是"换一条流"本身的代价
+（每次集合通信两次 `cudaEventRecord` + 两次 `cudaStreamWaitEvent`，
+外加主流要等 `side.done`）。
+而 R1 的分块重叠只买回 **1.58 点**（39.9610 → 39.3311），**小于这 2.37 点的地板**，
+所以怎么叠都翻不了正。
+
+| # | 路线 | 实测收益 | 成立条件 | 主要风险 | 状态 |
+|---|---|---|---|---|---|
+| R1 | AR 移出主流 + 分块流水 | **−5.35%（80K）**；其中分块重叠本身**是正的**：相对 R2 回收 **1.58 点** | 已实现 | 数值次序变化（本模型 hash 未变）；rank 门控不同步会**死锁** | **已实现、已实测、默认关、不划算** |
+| R2 | 只把 AR 放独立流、不分块 | **−7.04%**（80K）。其中 **4.37 点**来自去掉 host drain，**2.37 点**来自换流的固定开销 | 已实现 | — | 已实现、已实测、默认关 |
+| **R5** | **让自定义 one-stage all-reduce 支持侧流，再叠 R1 的分块** | **已实现并实测，结论是不要用**：8K 上比同一配置（`splits=8`）**慢 6.5%**；80K 上直接 **`cudaErrorIllegalAddress` 崩掉**（exit 134） | 需要 `FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1` + `FASTLLM_CUDA_CUSTOM_ALLREDUCE=1` 同时打开，且分块必须 ≤ 8 MiB | 非默认流上的二阶段自定义内核非法访存；机制未坐实 | **已实现、已实测、默认关、崩溃，禁止开启** |
+| R3 | 抬掉 SM70 force-sync 门（`FASTLLM_SM70_NCCL_ASYNC=1`） | 同步 **−45%**，**并发仍 1、墙钟 0**（引擎实测，§8.1） | 已实现 | 跨 rank 死锁（SM70 理由仍在） | 已实现、仅实验、**默认关** |
+
+**撤错留痕（本表的前两版）**
+
+第一版（更早）：把 R2 那 7 个点归因于"侧流路径必须关掉自定义 one-stage
+all-reduce，改用 NCCL"，并据此把 R5 列为"唯一还值得做的方向"。**归因是错的**，
+来自只读了 `fastllm-multicuda.cu` 里那句 `allowCustomAllReduce=false` 就外推，
+没有去查自定义 AR 在本机到底有没有被启用。
+
+第二版（本轮前半）：改口说 R5 的"收益恒为 0，因为分块张量 10 MiB 超过
+`CustomArMaxBytes() = 8 MiB`，连强制模式都进不去"。**这一版也错了**：10 MiB 是
+`splits=4` 的结果，`splits=8` 时每片只有 5 MiB，在上限之内。本轮把 R5 真正实现
+并测了，实测结果见上面 R5 行与 §8.8。教训是同一条：**先把"目标状态可达"验证掉，
+再谈收益**，而且不要用一次算例代替全部算例。
+
+**结论**：**R1 能藏住延迟（1.58 点），但侧流这条路的地板是 2.37 点，藏不回来。**
+要压掉那 2.37 点只能去掉事件同步，而事件同步正是流间定序的唯一手段，
+去掉就是 §8.7 那个死锁。R5 走的是"把自定义 AR 搬上侧流"这条绕行路，
+实测既慢又崩（§8.8）。**所以 R1/R2/R5 这条线结案：全部默认关，不再投入。**
+
+### 8.3 唯一有引擎支撑的上界：设备空闲时间
+
+只读引擎自己的 180K trace，不依赖任何未实现的东西：
+
+**注意：这里必须只看稳态段。** 全部 118.2 s 窗口里含约 12.4 s 的 warmup
+（权重加载 / 预热），那一段空闲多、但不属于那条 180K prefill：
+
+```
+全段    : busy 108.45 / span 118.20 = 91.8% 忙 -> 空闲 9.70 s（含 warmup）
+稳态段  : 只取 >=12.4 s 的窗口
+          busy 102.10 / span 105.27 = 97.0% 忙 -> 空闲 3.17 s
+       -> 折算到干净跑 104.2 s：约 3.1 s，即总量的约 3%
+```
+
+**含义**：稳态段设备已 **97.0%** 忙，所以**即使把全部等待填满，空间也只有约 3.1 s**
+（早先本行写的 8.6 s 是把 warmup 的 6.6 s 一起算进来的错误口径，已更正）。
+这是"并发最多能带来多少"的**上界**，不是 R1 的预期收益；R1 只会比它小。
+
+**而且这 3.17 s 里大半填不了。** 稳态段 >10 ms 的间隙共 44 个，其中 **43 个**的
+前后内核组合是同一个：`ncclDevKernel_AllReduce_Sum_f16_RING_LL` →
+`ncclDevKernel_Broadcast_RING_LL`（每次约 34.5 ms）。这是 **NCCL 内部**
+allreduce→broadcast 的交接，不是"GPU 在等主机"，挪算子流填不进去。
+
+### 8.4 本轮新增的开关
+
+| 开关 | 作用 | 默认 | 状态 |
+|---|---|---|---|
+| `FASTLLM_SM70_NCCL_ASYNC=1` | 覆盖 `basellm.cpp` 的 SM70 架构门，让 warmup 后 `ncclForceSync=false`。仅用于并发实验 | **关** | 已实现、引擎实测同步 −45%、并发不变 |
+| `FASTLLM_TP_AR_SIDE_STREAM=1` | 把 TP all-reduce 丢到每 (卡,线程) 一条侧流上，主机不再为每次集合通信阻塞 | **关** | 已实现、已实测（§8.2 的 R2） |
+| `FASTLLM_TP_AR_SIDE_STREAM_PIPELINE=1` | 在 R2 基础上把行并行输出按行分块，第 c 片的 AR 盖住第 c+1 片的 GEMM | **关** | 已实现、已实测（§8.2 的 R1） |
+| `FASTLLM_TP_AR_SIDE_STREAM_SPLITS=N` | 分几块，默认 4 | 4 | — |
+| `FASTLLM_TP_AR_SIDE_STREAM_HOST_SYNC=1` | 把侧流路径在发射后本来刻意省掉的 `cudaStreamSynchronize` 加回来。**只用于拆 R2 那 7 个点**，不是能上线的模式 | **关** | 已实现、已实测（§8.2，把 7.04 点拆成 4.37+2.37） |
+| `FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1` | R5：允许自定义 one-stage all-reduce 跑在侧流上。需同时 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=1` 且分块 ≤ 8 MiB 才生效 | **关** | 已实现、已实测：8K 慢 13.2%，**80K 非法访存崩溃**，禁止开启（§8.8） |
+| `FASTLLM_CUSTOM_AR_CENSUS=1` | 自定义 AR 的接单普查：按四条理由（超尺寸上限 / 策略拒绝 / 指针登记拒绝 / 真正发射）计数并统计重放字节，退出时打印 | **关** | 已实现。**判断"自定义 AR 有没有参与"的唯一可靠手段**（§8.8） |
+| `FASTLLM_TP_AR_DEBUG=1` | 每次 Begin/End 与每个分块打一行到 stderr。**卡死时唯一的定位手段** | **关** | 已实现 |
+
+### 8.5 已经做完的三步（原计划）
+
+1. **在引擎里实现 R1 的最小形态**——已完成（§8.7）。
+2. **量 `t_>=2` 是否 >0**——**未做**。本轮改用了一个更直接、更便宜的证据：
+   死锁与修复都由探针计数判定（`[R1dbg-p]` 四卡是否对称），见 §8.7。
+   nsys 的 `max_concurrent` 计数仍待补，但 §8.2 已给出墙钟结论，不影响取舍。
+3. 量墙钟——已完成：80K 上 R1 比对照慢 5.35%（§8.2）。
+
+### 8.6 复跑方式
+
+```sh
+# 8K 匹配对照（§8.0）
+PYTHONPATH=build-sm70-tests/tools FASTLLM_MULTICUDA_ASYNC_DISPATCH=0 \
+  python3 -m ftllm.cli benchmark /home/models/Qwen3.8-27B-QUASAR-NVFP4 \
+  --tp 4 --dtype auto --tokens 200000 --max_batch 1 --gpu_mem_ratio 0.98 \
+  --kv_cache_dtype fp8_e4m3 --low_gpu_mem --chunked_prefill_size 4096 \
+  --input_tokens 8192 --output_tokens 8 --batch 1 --warmup 0
+
+# 并发实验（§8.1）：同样的命令，前面加
+FASTLLM_SM70_NCCL_ASYNC=1
+```
+
+并发用 sqlite 扫：`max_concurrent` = 对某 device 的内核区间做扫描线取峰值；
+`t_>=2` = 在飞内核数 ≥2 的时间总和。
+
+### 8.7 R1 实现记录：一个"门控不同步"导致的四卡死锁（2026-09-16）
+
+这一节是 §8.2 那三行数字背后的过程。写它的原因：**这个 bug 的表现是"GPU1 卡死"，
+而进程既不报错也不退出**，第一次碰只能靠逐卡利用率看出来。
+
+#### 8.7.1 现象
+
+跑 `FASTLLM_QWEN35_SM70_CUDA_GRAPH=0 FASTLLM_TP_AR_SIDE_STREAM=1
+FASTLLM_TP_AR_SIDE_STREAM_PIPELINE=1` 时进程不退出、不打错误，日志停在
+`TP AR chunked pipeline: engaged with 4 splits (1024 rows/chunk)`，逐卡利用率是
+
+```
+GPU0 100%   GPU1 0%   GPU2 100%   GPU3 100%
+```
+
+TP 集合通信挂住时的指纹就是这条：**卡住的那个 rank 没有任何内核（0%），
+另外几个在 NCCL 里空转（100%）**。而且卡住的是哪张卡每次不一样
+（先 GPU1，后 GPU3），所以不是"某张卡上的逻辑分支写错了"，是竞态/次序不一致。
+
+对照：同样的命令**不开 R1** 时 44 s 正常跑完、hash 对。所以问题在 R1。
+再二分：**只开 `FASTLLM_TP_AR_SIDE_STREAM=1`、不开 PIPELINE** 也是正常的
+（1536 次集合通信走侧流，3.5108 s）。所以问题在**分块那一段**。
+
+#### 8.7.2 定位手段：两行探针 + 一个看门狗
+
+用 `timeout` 干等是浪费（第一次白等了十几分钟）。改成：
+
+* `tools/gpu_watchdog.sh` 包住命令，连续 4 次采样出现"≥2 卡在跑、≥1 卡 util=0"
+  就判定卡死，**立刻**抓现场（逐卡利用率、目标进程每个线程的 `wchan`/`syscall`、
+  日志尾部、Xid 前后计数）并杀掉。45 s 内就拿到了结论。
+* `FASTLLM_TP_AR_DEBUG=1` 让每次 `Begin`/`End` 和每个分块各打一行探针，
+  **带 device id**。卡死时每个 rank 的最后一行就说明它停在哪一步。
+
+探针给出的关键读数：
+
+| 读数 | dev0 | dev1 | dev2 | dev3 |
+|---|---:|---:|---:|---:|
+| 分块流水线探针行数 `[R1dbg-p]` | **234** | **0** | **0** | **0** |
+| 侧流集合通信次数（`Begin`） | 106 | 30 | 36 | 36 |
+
+**分块流水线只跑在 0 号卡上，1/2/3 号卡一次都没进去。**
+0 号卡每层发 4 次集合通信（分 4 片），另外三张每层发 1 次（不分块）。
+NCCL 是**按位置配对**的，第 2 个位置就把"1024 行的分片 reduce"和"4096 行的整体
+reduce"配到了一起，于是挂住。
+
+#### 8.7.3 根因：那道门读了 rank 独有的状态
+
+`Qwen3CudaTryTpChunkedLinearResidualReducePipeline` 里原来的门控有一项：
+
+```cpp
+middle.dims.back() != weight.dims[0]      // 旧代码
+```
+
+`middle` 就是 `buf.mlpPart`。它**只在 rank0 的 fallback 分支里被创建**：
+rank0 走 `Qwen3CudaLinearAddBlock`（内部会 `Qwen3CudaPrepareLocalOutput(middle)`），
+而 1/2/3 号卡的 fallback 是 `Qwen3CudaLinear(runner, input, weight, bias, hiddenStates)`
+——**直接把 GEMM 写进残差，从不碰 `middle`**。所以 1/2/3 号卡的 `middle.dims`
+**整轮都是空的**，门控永远拒绝它们。
+
+形状打印（`FASTLLM_TP_AR_DEBUG=1` 时在拒因处各卡打前 3 次）证实了这一点：
+四张卡报的形状**完全一致**（`w=[5120,1536]`、`res=[1,1,5120]`、`in=[1,1,1536]`），
+只有 `mid=[-]`（空）。
+
+**教训**：原代码的注释写着"这个判据是 rank 不变的"，理由是
+"`rows, splits, chunk, dtype` 每张卡都一样"——这句是对的，但那个判据**还读了
+`middle.dims`**，而它是 rank 独有的。**跨 rank 的判据只能读跨 rank 一致的状态**，
+这一点必须在代码里写死，不能靠"我检查过了"。
+
+#### 8.7.4 修法
+
+1. 门控只读**跨 rank 一致**的量：`hiddenStates`（残差，各卡相同）、`input` 的
+   数据类型与行数、`weight.dims.size()`、环境变量。**删掉对 `middle.dims` 的依赖。**
+2. `middle` 改由流水线**自己定形**（`PrepareLocalOutput` + `Resize` + `Allocate`，
+   照 `PrepareLocalOutput` 在别处的既有用法），**在 fork 任何集合通信之前**完成
+   ——这样"某张卡要分配内存"不会打乱集合通信的次序。
+3. 探针里补上 device id：拒因、形状、每个分块都带 `dev=`。原来的计数是
+   进程级共享的，一个 rank 静默回退和四张卡都回退看起来一模一样。
+
+修完的对称性证据（8K，同样开关）：
+
+| 读数 | dev0 | dev1 | dev2 | dev3 |
+|---|---:|---:|---:|---:|
+| `[R1dbg-p]` 行数 | 3456 | 3456 | 3456 | 3456 |
+| 分块调用次数 | 384 | 384 | 384 | 384 |
+
+`P:join` 共 1536 = 384 × 4，四卡完全对称；hash 与对照一致，看门狗判定 OK。
+
+#### 8.7.5 结论
+
+* R1 **能跑通、数值正确**（8K 与 80K 的 sha256 均与对照一致）。
+* R1 的**分块重叠本身是有效的**：相对"只开侧流"回收 **1.58 点**。
+* 侧流路径的净代价是 **2.37 点**（每次集合通信的事件定序 + 主流等 `side.done`）。
+  叠加后 R1 净结果 **−5.35%**。**R1 单独不划算，默认关。**
+* 本节前一版把侧流的代价记成 7 点、并归因于"丢掉了自定义 all-reduce"。
+  **已更正**：7 点里 4.37 点是去掉 host drain，2.37 点才是换流的开销。
+  自定义 all-reduce 在本机**默认**不参与 prefill（见 §8.8 的实测）。
+
+### 8.8 R5 实现记录：自定义 one-stage all-reduce 走侧流（2026-09-16 深夜）
+
+**做了什么。** 给自定义 AR 加了一条流参数，再让侧流路径可以用它：
+
+* `FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId, stream)`——
+  `stream == nullptr` 就是原来的行为（调用线程的默认流）；传自己的流就排到那条流上。
+  捕获期间拒绝非默认流：图捕获路径把发射录在默认流上，混用会破坏图。
+* `LaunchCustomAr<T>` 与 `RunCustomArCandidate` 逐层透传该流，**包括 in-place
+  scratch 的 copy-back**（那一处如果漏了，结果会被拷到另一条流上）。
+* 开关 `FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1`（默认关）。
+
+**真正的接线障碍不是"内核写死了自己的流"，而是 `allowCustomAllReduce`。**
+`FastllmNcclAllReduceOnStream` 一直传 `allowCustomAllReduce=false`，所以不论
+`FASTLLM_CUDA_CUSTOM_ALLREDUCE` 怎么设，侧流路径连自定义 AR 的入口都进不去。
+这一点是 census 抓出来的（见下），不是读代码读出来的。
+
+**新增了一个可复用的量具：census**（`FASTLLM_CUSTOM_AR_CENSUS=1`，默认关）。
+自定义 AR 有四个静默拒绝的理由，只看时间分不清"跑在自定义内核上"和"悄悄交给
+NCCL"。census 按理由计数并统计重放字节数，退出时打印。它本轮直接纠正了我两次判断：
+
+```
+# 接错线时（8192 次全来自默认流的非重叠集合通信）
+    declined: over size cap / type          0 call(s),       0.0 MiB
+    launched on the custom kernel        8192 call(s),     210.0 MiB
+# 接对线后（侧流上的分块也进去了）
+    launched on the custom kernel       20480 call(s),   61650.0 MiB
+```
+
+**实测 1：80K 上强制自定义 AR、但**不走**侧流（即 R1 关）**
+
+| 读数 | 值 |
+|---|---|
+| Total / sha256 | **37.0933 s** / `1d23759c`（对照走 NCCL 是 37.3322 s） |
+| census：超尺寸上限被拒 | **10752 次，420480 MiB** |
+| census：跑在自定义内核上 | 8192 次，210 MiB（平均 26 KiB） |
+
+两件事被**测出来**了：① 引擎默认路径上，**所有 40 MiB 的 prefill 张量都因为
+`CustomArMaxBytes() = 8 MiB` 被拒**，一字节都没走自定义内核（10752 × 40 MiB =
+420480 MiB 全部退回 NCCL）；② 自定义 AR 在它够得着的那些小张量上并不亏
+（37.0933 vs 37.3322，略快且 hash 一致）。
+
+**实测 2：R5（侧流 + 自定义 AR），8K，全部 sha256 `adcb1bd7`**
+
+| 配置 | Total | 相对对照 |
+|---|---:|---:|
+| 对照（不开 R1） | 3.2568 s | — |
+| R1 `splits=8`（不开自定义 AR） | 3.4882 s | +7.11% |
+| R5，接线错误（自定义 AR 只在默认流上生效） | 3.4688 s | +6.51% |
+| **R5，接线正确（自定义 AR 真上了侧流）** | **3.9495 s** | **+21.3%** |
+
+所以 R5 相对同配置（`splits=8`）**慢 13.2%**。
+
+**实测 3：R5 在 80K 上崩，而且**把三张卡打到设备级异常**。**
+`R1 + splits=8 + 自定义 AR 走侧流`，80K：`exit=134`，日志给出
+`CUDA error = 700, cudaErrorIllegalAddress`（`fastllm-multicuda.cu:194`），
+四张卡各报一次，随后 `terminate`。更严重的是内核日志：
+
+```
+[11039.499526] NVRM: Xid (PCI:0000:05:00): 13, Graphics SM Warp Exception on
+               (GPC 5, TPC 4, SM 0): Out Of Range Address
+[11039.501310] NVRM: Xid (PCI:0000:08:00): 13, Graphics Exception: ESR ...
+[11039.503102] NVRM: Xid (PCI:0000:07:00): 13, Graphics Exception: ESR ...
+[11039.523185] NVRM: Xid (PCI:0000:07:00): 43, pid=916085, name=python3, Ch 00000008
+[11039.545157] NVRM: Xid (PCI:0000:05:00): 43, pid=916085, name=python3, Ch 00000008
+```
+
+`tools/gpu_watchdog.sh` 的跑前/跑后计数把归属钉死了：这次 **Xid 3 → 330**（新增
+327 行），而**同一次会话里之后两次运行都是 330 → 330**：
+
+| 运行 | 配置 | Xid 跑前→跑后 | 结果 |
+|---|---|---|---|
+| R5 80K | R1 `splits=8` + 自定义 AR 走侧流 | **3 → 330** | exit 134 |
+| 判别 80K | 强制自定义 AR，**不走侧流**（R1 关） | 330 → 330 | exit 0，37.0933 s，hash 对 |
+| 回归 8K | 全默认 | 330 → 330 | exit 0，3.2544 s，hash `adcb1bd7` |
+
+所以这个 SM 越界**只出现在自定义 AR 跑在非默认流上时**，不是自定义 AR 本身的问题，
+也不在默认路径上。事后四张卡健康：Retired Pages 0、单双比特 ECC 0、
+Pending Page Blacklist No、温度 47–49 °C、空闲 0 MiB，且随后两次完整四卡运行
+输出哈希都正确。
+
+机制**没有坐实**，只记边界：出问题时 `splits=8` 使每片 5 MiB，`useTwoStage` 为真，
+因此这是引擎里**第一次**把二阶段自定义内核放在非默认流上、以 in-place 方式跑
+prefill 尺寸的张量。是否与二阶段内核的跨 rank 屏障、或与
+`BuildCustomArRegistration` 里那次阻塞 `cudaMemcpy` 的流归属有关，未验证。
+
+**安全性**：该路径要同时打开 `FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1` 和
+`FASTLLM_CUDA_CUSTOM_ALLREDUCE=1` 才会走到，默认全部关闭，默认路径不受影响。
+**但因为它会让三张卡报设备级 SM 越界，代码里已按"禁止开启"写死在注释里**，
+保留开关只为让这个失败可复现、可修。
+
+**回归证据**（`build-sm70-tests/customAllReduceRegression`，四种配置全 PASS）：
+
+| ranks | `FASTLLM_CUDA_CUSTOM_ALLREDUCE` | 结果 |
+|---:|---|---|
+| 2 | 1（强制） | PASS，enabled=1，selected/tested_paths=6 |
+| 2 | 0（关闭） | PASS，enabled=0 |
+| 4 | auto | PASS，enabled=0（策略在 TP4 上关掉它） |
+| 4 | 1（强制） | PASS，enabled=1，selected/tested_paths=6 |
+
+说明这次透传流参数的改造对默认流上的行为是保持的。
+
+
+## 9. 补测 §8.5 缺的那一项：R1 下的 `t≥2`（2026-09-17）
+
+§8.5 第 2 条自己记着"量 `t_>=2` 是否 >0——**未做**"。本节把它补上，结果**推翻了
+§8.1/§8.3 的前提**。
+
+### 9.1 实测
+
+配置：`FASTLLM_QWEN35_SM70_CUDA_GRAPH=0 FASTLLM_TP_AR_SIDE_STREAM=1
+FASTLLM_TP_AR_SIDE_STREAM_PIPELINE=1 FASTLLM_TP_AR_SIDE_STREAM_SPLITS=8`，
+80K prompt、TP4、4×V100、chunk 4096、FP8 KV，device 0。
+
+| 轨迹 | `max_concurrent` | `t≥2` | 占窗口 |
+|---|---:|---:|---:|
+| **R1（侧流 + 分块 8）** | **2** | **10.5546 s** | **23.31%**（窗口 45.27 s）|
+| 对照：180K 无 R1（`pf180k.sqlite`）| 1 | 0.0000 s | 0% |
+
+并发度的时间分布（R1）：`c=0` 5.664 s / `c=1` 29.052 s / **`c=2` 10.555 s**，
+三者之和 = 窗口 45.27 s；`∫并发度 dt = 50.161 s = Σ各内核时长`（互查通过）。
+
+四条流：`419` 29.78 s（GEMM/attention 侧）、**`423` 17.77 s（集合通信侧）**、
+`46` 1.64 s、`412` 0.90 s。stream 423 上那 20480 个内核是
+`grid=2x1 block=288`、由 `cuLaunchKernelEx` 发起，即 NCCL all-reduce 的形状。
+
+工具自证：同一个扫描线脚本先在两条已知答案的轨迹上跑过
+（`pf180k` → `1 / 0.0000 s`，`dec80k` → 与文档记录一致）才用于本节。
+
+### 9.2 含义：前提被推翻，结论不变
+
+- **被推翻**：§8.1/§8.3 写的"队列深度 1、换流拿不到任何收益""要重叠必须先改主机
+  提交模型"。实测是：**换流之后设备上真的出现了两个内核同时飞，占窗口 23.3%**。
+  "并发不可能发生"这个前提是错的。
+- **不变**：R1 仍然是净亏。同场 A/B 实测：对照 **37.6385 s** vs R1 **40.4062 s**
+  （**+7.4%**）。所有臂 sha256 都是 `1d23759c81d9f3e7`。
+- 所以正确的说法是"**并发发生了，但没有变成墙钟收益**"，而不是"并发不可能"。
+
+### 9.3 同场待补（中断）
+
+同场 A/B 本要跑四臂（对照 / R2 / R1-s4 / R1-s8），对照完成后进程中途被一起
+GPU 硬件事故打断（见 §9.4），只拿到对照一个数。**R2、R1-s4、R1-s8 三臂未完成、
+无数据。**
+
+### 9.4 事故：GPU 掉卡（红线级，已停手报告）
+
+跑 R2 那一臂时四张卡全部掉线。内核日志：
+
+```
+NVRM: Xid (PCI:0000:07:00): 79, ... GPU has fallen off the bus.
+NVRM: Xid (PCI:0000:07:00): 154, GPU recovery action changed to 0x1 (GPU Reset Required)
+NVRM: Xid (PCI:0000:08:00/0000:09:00): 154 ... GPU Reset Required
+pcieport 0000:00:02.0: AER: Multiple Uncorrectable (Non-Fatal) error message received
+nvidia 0000:05:00.0/07:00.0/08:00.0/09:00.0: AER: can't recover (no error_detected callback)
+NVRM: Attempting to remove device 0000:05:00.0 with non-zero usage count!
+```
+
+`nvidia-smi` 报 `Unable to determine the device handle for GPU0..3: Unknown Error`、
+`No devices were found`；受害进程抛 `terminate called after throwing an instance of
+char const*`。
+
+**时间线**：崩溃日志早于我的作业取消；此前对照臂已正常完成。**本机同时有另一个
+代理在做 FlashInfer `pcie_ipc`，从本会话内部无法归因触发者。**
+
+**处置**：按 `fastllm/AGENTS.md` 的红线，**未对卡做任何动作**——没有 `kill -9`
+持卡进程、没有 `sleep` 后重试、没有 `nvidia-smi -r`、没有 PCI remove/rescan，
+只做了一次 `nvidia-smi`/`dmesg` 读取取证后停手报告。**需要人工介入。**
