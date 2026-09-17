@@ -344,6 +344,18 @@ int ChooseSplitK(int k) {
   if (groups <= 0) {
     return -1;
   }
+  // Measurement-only override (FASTLLM_SM70_QPN_SPLITK_FORCE=8|16|32). Default
+  // unset -> the logic below is unchanged. SplitK sets blockDim = 32*SplitK, i.e.
+  // it buys intra-CTA parallelism, NOT more CTAs (the grid depends only on n and m).
+  // Small-n decode shapes leave few CTAs, so a larger SplitK is the only lever that
+  // raises threads-per-SM there.
+  static const int forced = []() {
+    const char *v = std::getenv("FASTLLM_SM70_QPN_SPLITK_FORCE");
+    return v == nullptr ? 0 : std::atoi(v);
+  }();
+  if ((forced == 8 || forced == 16 || forced == 32) && groups % forced == 0) {
+    return forced;
+  }
   if (groups % 8 == 0) {
     return 8;
   }
