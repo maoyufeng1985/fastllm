@@ -877,6 +877,131 @@ void FastllmCustomAllReducePushAddKernel(
     }
 }
 
+// TP4 push all-reduce (plan: docs/sm70_tp4_push_ar_plan.md section 3.1).
+//
+// Generalises the TP2 PushAdd mechanism above to four ranks, drops the
+// residual-add semantics (this is a pure all-reduce), and -- unlike TP2, which
+// accumulates in half via __hadd -- accumulates in FP32 in rank order and
+// downcasts once.  That last point is not cosmetic: this project's correctness
+// gate is an unchanged token sha256, and FastllmCustomAllReduceKernel (the
+// shipped one-stage path) does upcast -> sum over ptrs[0..Ranks-1] -> single
+// downcast.  Matching that exactly is what lets the result be bit-identical
+// instead of merely close.
+//
+// Protocol, per 16-byte packet owned by one thread:
+//   1. clear +0 to -0 (the "slot written" marker) and store into each peer's
+//      slot [phase][self] on all three peers;
+//   2. poll the three local slots [phase][p], p != self, until no half is +0;
+//   3. accumulate slot0 + slot1 + slot2 + slot3 in FP32 in rank order, taking
+//      our own contribution from the local input when slot == Rank;
+//   4. write dest (local write only -- peers never touch our dest);
+//   5. clear each consumed slot back to +0.
+// Step 5 is what keeps the protocol correct across consecutive calls; see plan
+// section 3.3 for why the two-phase slot map plus this clear cannot lose data.
+template <typename T, bool UsePdl, int Rank>
+__global__ __launch_bounds__(1024, 1)
+void FastllmCustomAllReducePushKernel(
+        const T *__restrict__ input,
+        void *localWorkspace,
+        CustomArRankScratch peerWorkspaces,
+        CustomArSignal *selfSignal,
+        T *__restrict__ output,
+        int packedCount, size_t workspaceStride) {
+    using P = typename CustomArPacked<T>::P;
+    using A = typename CustomArPacked<T>::A;
+    static_assert(Rank >= 0 && Rank < 4, "TP4 push rank must be 0..3");
+    CustomArPdlWait<UsePdl>();
+
+    // Two phase slots per peer, so consecutive CUDA Graph replays use
+    // different slots and cannot overwrite in-flight data.
+    const int phase = selfSignal->pushCounter[blockIdx.x] & 1U;
+    const size_t phaseOffset = (size_t)phase * 4ULL * workspaceStride;
+    const int globalThread = blockIdx.x * blockDim.x + threadIdx.x;
+    const int globalStride = gridDim.x * blockDim.x;
+
+    // 1. Publish our contribution into every peer's [phase][Rank] slot.
+    for (int index = globalThread; index < packedCount;
+         index += globalStride) {
+        P value;
+        CustomArLoadGlobal16(value, input, index);
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            CustomArClearPositiveZero(value.data[item]);
+        }
+#pragma unroll
+        for (int peer = 0; peer < 4; ++peer) {
+            if (peer == Rank) {
+                continue;
+            }
+            void *pushPeer =
+                reinterpret_cast<char *>(peerWorkspaces.scratch[peer]) +
+                phaseOffset + (size_t)Rank * workspaceStride;
+            CustomArStoreRelaxedSystem16(value, pushPeer, index);
+        }
+    }
+
+    // 2-5. Gather, reduce in rank order, write, clear.
+    P empty{};
+    for (int index = globalThread; index < packedCount;
+         index += globalStride) {
+        A sum;
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+            P value;
+            if (slot == Rank) {
+                CustomArLoadGlobal16(value, input, index);
+            } else {
+                void *pollPeer =
+                    reinterpret_cast<char *>(localWorkspace) +
+                    phaseOffset + (size_t)slot * workspaceStride;
+                for (;;) {
+                    CustomArLoadRelaxedSystem16(value, pollPeer, index);
+                    bool ready = true;
+#pragma unroll
+                    for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+                        ready = ready &&
+                                !CustomArIsPositiveZero(value.data[item]);
+                    }
+                    if (ready) {
+                        break;
+                    }
+                }
+            }
+#pragma unroll
+            for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+                const float converted = CustomArUpcast(value.data[item]);
+                if (slot == 0) {
+                    sum.data[item] = converted;
+                } else {
+                    sum.data[item] += converted;
+                }
+            }
+        }
+        P result;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            result.data[item] = CustomArDowncast<T>(sum.data[item]);
+        }
+        CustomArStoreGlobal16(result, output, index);
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+            if (slot == Rank) {
+                continue;
+            }
+            void *pollPeer =
+                reinterpret_cast<char *>(localWorkspace) +
+                phaseOffset + (size_t)slot * workspaceStride;
+            CustomArStoreGlobal16(empty, pollPeer, index);
+        }
+    }
+
+    CustomArPdlTrigger<UsePdl>();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        selfSignal->pushCounter[blockIdx.x]++;
+    }
+}
+
 struct CustomArState {
     std::mutex mutex;
     std::condition_variable condition;
@@ -993,6 +1118,96 @@ bool CustomArUseTwoStage(size_t ranks, size_t bytes) {
 bool CustomArUsePushAdd(const CustomArState &state, size_t bytes) {
     return state.devices.size() == 2 && state.pushAvailable &&
            bytes <= kCustomArPushMaxBytes;
+}
+
+// TP4 push all-reduce eligibility (plan: docs/sm70_tp4_push_ar_plan.md 3.2).
+//
+// Deliberately narrow so the shipped path is untouched unless asked for:
+// exactly 4 ranks, only small messages (below the 40 KiB NCCL hard cut, which
+// is where the push handshake saving actually matters), 16-byte aligned for the
+// packed 16B slot stores, and a successfully allocated push workspace.  Anything
+// else returns false and the caller keeps using the one-stage kernel.
+bool CustomArPush4EnabledFromEnv() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH4");
+        if (env == nullptr || env[0] == '\0') {
+            return false;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return value != "0" && value != "false" && value != "off" &&
+               value != "no";
+    }();
+    return enabled;
+}
+
+bool CustomArUsePush4(const CustomArState &state, size_t bytes) {
+    return state.devices.size() == 4 && state.pushAvailable &&
+           CustomArPush4EnabledFromEnv() &&
+           bytes > 0 && bytes % 16 == 0 &&
+           bytes < kCustomArAutoNcclMinBytes &&
+           bytes <= kCustomArPushMaxBytes;
+}
+
+// Launch the TP4 push kernel for one rank.  Mirrors the TP2 push launch
+// (occupancy-matched grid, optional PDL) but takes the whole rank workspace
+// array, since unlike TP2 every rank both publishes to three peers and polls
+// three local slots.
+template <typename T>
+bool LaunchCustomArPush4(CustomArState &state, const T *input, T *output,
+                         int rank, int packedCount, cudaStream_t stream) {
+    if (rank < 0 || rank >= 4) {
+        return false;
+    }
+    int threads = kCustomArThreads;
+    while (threads < 1024 &&
+           (packedCount + threads - 1) / threads > state.pushBlocks) {
+        threads *= 2;
+    }
+    const int blocks = std::max(
+        1, std::min(state.pushBlocks,
+                    (packedCount + threads - 1) / threads));
+    const cudaStream_t launchStream = stream;
+    cudaError_t launchState = cudaSuccess;
+    // The peer workspace tuple must point at the PUSH workspaces, not at
+    // allScratch (which holds the one-stage inplace buffers).  Index i holds
+    // peer rank i's push buffer, whose slot [phase][self] we publish into.
+    CustomArRankScratch peerWorkspaces{};
+    for (int i = 0; i < 4; ++i) {
+        peerWorkspaces.scratch[i] = state.allPushWorkspaces.workspaces[i];
+    }
+#define CUSTOM_AR_PUSH4_CASE(RANK_VALUE)                                     \
+    FastllmCustomAllReducePushKernel<T, false, RANK_VALUE>                   \
+        <<<blocks, threads, 0, launchStream>>>(                              \
+            input, state.allPushWorkspaces.workspaces[rank],                  \
+            peerWorkspaces, state.allSignals.signals[rank], output,           \
+            packedCount, kCustomArPushMaxBytes)
+    switch (rank) {
+        case 0: CUSTOM_AR_PUSH4_CASE(0); break;
+        case 1: CUSTOM_AR_PUSH4_CASE(1); break;
+        case 2: CUSTOM_AR_PUSH4_CASE(2); break;
+        default: CUSTOM_AR_PUSH4_CASE(3); break;
+    }
+#undef CUSTOM_AR_PUSH4_CASE
+    launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr,
+                     "[Fastllm] TP4 push all-reduce launch failed on GPU %d: %s.\n",
+                     state.devices[rank], cudaGetErrorString(launchState));
+        std::fflush(stderr);
+        return false;
+    }
+    static std::atomic<bool> push4Logged{false};
+    bool expected = false;
+    if (push4Logged.compare_exchange_strong(expected, true)) {
+        std::fprintf(stderr,
+                     "[Fastllm] TP4 push all-reduce engaged "
+                     "(FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH4).\n");
+        std::fflush(stderr);
+    }
+    return true;
 }
 
 uint32_t CustomArPathFor(size_t ranks, size_t bytes, int dataType) {
@@ -1238,11 +1453,23 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
 template <typename T>
 bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
                     T *output, int rank, int count, bool writeAfterBarrier,
-                    bool skipEndBarrier) {
+                    bool skipEndBarrier,
+                    cudaStream_t stream = cudaStreamPerThread) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+
+    // TP4 push all-reduce: take the small-message path when explicitly enabled
+    // (FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH4=1) and eligible.  Everything about
+    // this branch is opt-in, so the shipped behaviour is byte-for-byte the old
+    // one when the variable is unset (the default).
+    //
+    // NOTE: this function deliberately does not receive the input pointer (the
+    // one-stage kernel reads every rank's input from `rankData`, which lives in
+    // DEVICE memory and must never be dereferenced on the host), so the push
+    // launch happens in RunCustomArCandidate, which does have `data`.
+
     // In the two-stage algorithm every rank reduces only its 1/RANKS shard
     // and then gathers equally sized peer shards.  Size the grid for that
     // largest shard; using the full tensor count creates RANKS-1 idle blocks
@@ -1258,13 +1485,13 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
     case RANKS:                                                              \
         if (useTwoStage) {                                                   \
             FastllmCustomAllReduceTwoStageKernel<T, RANKS>                   \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, kCustomArThreads, 0, stream>>>(                    \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], state.allScratch,        \
                     output, rank, packedCount);                              \
         } else {                                                             \
             FastllmCustomAllReduceKernel<T, RANKS>                           \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, kCustomArThreads, 0, stream>>>(                    \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], output, rank,            \
                     packedCount, writeAfterBarrier, skipEndBarrier);         \
@@ -1452,9 +1679,73 @@ bool LaunchCustomArPairAdd(CustomArState &state,
     return true;
 }
 
+// Engagement census (FASTLLM_CUSTOM_AR_CENSUS=1, default off). Every claim of
+// the form "the custom path is in play" / "the custom path was skipped" needs
+// this: the candidate declines silently for four different reasons, so timing
+// alone cannot tell "ran on the custom kernel" from "handed the tensor to
+// NCCL". Counting the declines by reason is the difference between reading the
+// policy in the source and measuring it.
+enum CustomArCensusSlot {
+    kCensusOverSizeCap = 0,
+    kCensusPolicyDeclined = 1,
+    kCensusPointerDeclined = 2,
+    kCensusLaunched = 3,
+    kCensusSlots = 4,
+};
+
+std::atomic<long> g_customArCensusCalls[kCensusSlots];
+std::atomic<long> g_customArCensusBytes[kCensusSlots];
+
+bool CustomArCensusEnabled() {
+    static const bool on = []() {
+        const char *v = std::getenv("FASTLLM_CUSTOM_AR_CENSUS");
+        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+    }();
+    return on;
+}
+
+void CustomArCensusReport() {
+    if (!CustomArCensusEnabled()) {
+        return;
+    }
+    static const char *names[kCensusSlots] = {
+        "declined: over size cap / type",
+        "declined: published policy",
+        "declined: pointer registration",
+        "launched on the custom kernel",
+    };
+    std::fprintf(stderr, "[Fastllm] custom AR census (per rank):\n");
+    for (int i = 0; i < kCensusSlots; ++i) {
+        std::fprintf(stderr, "    %-32s %8ld call(s), %9.1f MiB replayed\n",
+                     names[i], g_customArCensusCalls[i].load(),
+                     (double)g_customArCensusBytes[i].load() / 1048576.0);
+    }
+    std::fflush(stderr);
+}
+
+bool CustomArCensusReportRegistered() {
+    static const bool once = []() {
+        std::atexit(CustomArCensusReport);
+        return true;
+    }();
+    return once;
+}
+
+void CustomArCensusNote(int slot, size_t bytes, bool census) {
+    if (!census) {
+        return;
+    }
+    CustomArCensusReportRegistered();
+    g_customArCensusCalls[slot].fetch_add(1, std::memory_order_relaxed);
+    g_customArCensusBytes[slot].fetch_add((long)bytes,
+                                          std::memory_order_relaxed);
+}
+
 bool RunCustomArCandidate(void *data, void *dest, int count,
                           int dataType, int deviceId,
-                          bool requireEnabledPath = false) {
+                          bool requireEnabledPath = false,
+                          cudaStream_t stream = cudaStreamPerThread,
+                          bool census = false) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return false;
     }
@@ -1462,6 +1753,7 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
         bytes % 16 != 0) {
+        CustomArCensusNote(kCensusOverSizeCap, bytes, census);
         return false;
     }
 
@@ -1470,12 +1762,14 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     CustomArCallLease lease;
     if (!lease.Acquire(state, bytes, dataType, deviceId,
                        requireEnabledPath, rank)) {
+        CustomArCensusNote(kCensusPolicyDeclined, bytes, census);
         return false;
     }
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
                                         dataType, rankData)) {
+        CustomArCensusNote(kCensusPointerDeclined, bytes, census);
         return false;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
@@ -1492,27 +1786,64 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     // caller must not overwrite any rank's input until the next start barrier
     // or a host sync. In-place still needs the end barrier.
     const bool skipEndBarrier = data != dest && !useTwoStage;
+
+    // TP4 push all-reduce (plan: docs/sm70_tp4_push_ar_plan.md).  This is the
+    // only place with a usable host-side input pointer: `rankData` holds the
+    // peer input addresses in DEVICE memory, so the push kernel takes `data`
+    // directly.  Opt-in via FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH4 (default off);
+    // when unset the code below is exactly the shipped path.
+    //
+    // The kernel's loop variable counts 16-byte PACKETS, not elements, so pass
+    // bytes/16 -- not the element count.  (Passing elements makes the loop run
+    // packedWidth times too long and read past the buffer.)
+    if (!useTwoStage && CustomArUsePush4(state, bytes)) {
+        const int packetCount = (int)(bytes / 16);
+        if (dataType == fastllm::DataType::FLOAT16 &&
+            LaunchCustomArPush4<half>(
+                state, reinterpret_cast<const half *>(data),
+                reinterpret_cast<half *>(dest), rank, packetCount, stream)) {
+            CustomArCensusNote(kCensusLaunched, bytes, census);
+            return true;
+        }
+        if (dataType == fastllm::DataType::BFLOAT16 &&
+            LaunchCustomArPush4<__nv_bfloat16>(
+                state, reinterpret_cast<const __nv_bfloat16 *>(data),
+                reinterpret_cast<__nv_bfloat16 *>(dest), rank, packetCount,
+                stream)) {
+            CustomArCensusNote(kCensusLaunched, bytes, census);
+            return true;
+        }
+        if (dataType == fastllm::DataType::FLOAT32 &&
+            LaunchCustomArPush4<float>(
+                state, reinterpret_cast<const float *>(data),
+                reinterpret_cast<float *>(dest), rank, packetCount, stream)) {
+            CustomArCensusNote(kCensusLaunched, bytes, census);
+            return true;
+        }
+    }
+
     bool launched = false;
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<half *>(kernelDest),
-                                  rank, count, fusedCopyBack, skipEndBarrier);
+                                  rank, count, fusedCopyBack, skipEndBarrier,
+                                  stream);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         launched = LaunchCustomAr(
             state, rankData, reinterpret_cast<__nv_bfloat16 *>(kernelDest),
-            rank, count, fusedCopyBack, skipEndBarrier);
+            rank, count, fusedCopyBack, skipEndBarrier, stream);
     } else if (dataType == fastllm::DataType::FLOAT32) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<float *>(kernelDest),
-                                  rank, count, fusedCopyBack, skipEndBarrier);
+                                  rank, count, fusedCopyBack, skipEndBarrier,
+                                  stream);
     }
     if (!launched) {
         return false;
     }
     if (kernelDest != dest) {
         cudaError_t copyState = cudaMemcpyAsync(
-            dest, kernelDest, bytes, cudaMemcpyDeviceToDevice,
-            cudaStreamPerThread);
+            dest, kernelDest, bytes, cudaMemcpyDeviceToDevice, stream);
         if (copyState != cudaSuccess) {
             FastllmCudaSetThreadError();
             std::fprintf(stderr,
@@ -1523,6 +1854,7 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
             return false;
         }
     }
+    CustomArCensusNote(kCensusLaunched, bytes, census);
     return true;
 }
 
@@ -2130,6 +2462,51 @@ uint32_t AutoTuneCustomAr(CustomArState &state) {
          (int)fastllm::DataType::FLOAT32, "FP32", "large"},
     };
 
+    // FASTLLM_CUSTOM_AR_SWEEP=1: additionally measure custom vs NCCL on a ladder of
+    // message sizes and print it as a table. This is a MEASURING INSTRUMENT only --
+    // it never changes which paths get enabled, because the enabled set is decided by
+    // the two sizes above, exactly as before. Reason it exists: the enabled decision
+    // is taken at 10 KiB and 1 MiB only, so nothing in this repository says how the
+    // two implementations compare in the 40 KiB .. 1 MiB band, which is the band the
+    // external PCIe-oneshot write-ups claim advantage in.
+    if (const char *sweepEnv = std::getenv("FASTLLM_CUSTOM_AR_SWEEP")) {
+        if (sweepEnv[0] != '\0' && std::string(sweepEnv) != "0") {
+            const size_t ladder[] = {40ULL << 10, 160ULL << 10, 512ULL << 10,
+                                     (1ULL << 20), 4ULL << 20, 8ULL << 20};
+            std::fprintf(stderr,
+                "[Fastllm] custom all-reduce size sweep (instrument only; never "
+                "changes the enabled set). %zu GPUs, %s.\n"
+                "  %-10s %14s %14s %8s\n",
+                state.devices.size(), useCudaGraph ? "CUDA Graph replay" : "eager",
+                "bytes", "custom us", "NCCL us", "custom/NCCL");
+            for (size_t bytes : ladder) {
+                CustomArBenchBuffers buffers;
+                if (bytes > CustomArMaxBytes() ||
+                    !AllocateCustomArBenchBuffers(state.devices, bytes, buffers)) {
+                    std::fprintf(stderr, "  %-10zu %14s %14s %8s\n",
+                                 bytes, "-", "-", "no buffer");
+                    continue;
+                }
+                bool ok = CheckCustomArCorrectness(
+                    state, buffers, bytes, (int)fastllm::DataType::FLOAT16);
+                float customUs = 0.0f, ncclUs = 0.0f;
+                bool benchOk = ok && BenchmarkCustomArPath(
+                    state, buffers, bytes, (int)fastllm::DataType::FLOAT16,
+                    useCudaGraph, customUs, ncclUs);
+                FreeCustomArBenchBuffers(state.devices, buffers);
+                if (!benchOk) {
+                    std::fprintf(stderr, "  %-10zu %14s %14s %8s\n",
+                                 bytes, "-", "-", ok ? "bench failed" : "correctness failed");
+                    continue;
+                }
+                std::fprintf(stderr, "  %-10zu %14.3f %14.3f %7.3fx\n",
+                             bytes, customUs, ncclUs,
+                             ncclUs > 0.0f ? customUs / ncclUs : 0.0f);
+            }
+            std::fflush(stderr);
+        }
+    }
+
     uint32_t enabledPaths = 0;
     for (const PathCase &path : paths) {
         CustomArBenchBuffers buffers;
@@ -2359,8 +2736,13 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         }
         state.allScratch.scratch[rank] = state.inplaceScratch[rank];
     }
-    const bool wantPush = ok && devices.size() == 2 &&
-                          CustomArPushEnabledFromEnv();
+    // The push workspace is shared by the TP2 PushAdd path and the TP4 push
+    // path, so allocate it when either is enabled.  TP4 only opts in via
+    // FASTLLM_CUDA_CUSTOM_ALLREDUCE_PUSH4, so the default (both unset) still
+    // skips the allocation entirely.
+    const bool wantPush =
+        ok && ((devices.size() == 2 && CustomArPushEnabledFromEnv()) ||
+               (devices.size() == 4 && CustomArPush4EnabledFromEnv()));
     if (wantPush) {
         bool pushOk = true;
         int minSmCount = kCustomArPushMaxBlocks;
@@ -2524,9 +2906,27 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     return enabled;
 }
 
+// `stream` is the stream this reduction has to be ordered on; nullptr means the
+// caller's per-thread default stream, which is what every existing caller wants.
+// A caller that is overlapping the collective with other work passes its own
+// stream. Two things make that safe rather than merely legal: the copy-back path
+// (RunCustomArCandidate) follows the same stream, and the CUDA-graph capture path
+// is refused, because CaptureCustomArRankGraphs records the launch on the default
+// stream and a side-stream launch would not be part of that graph.
 bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
-                                int dataType, int deviceId) {
-    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true);
+                                int dataType, int deviceId, void *stream) {
+    cudaStream_t target = stream == nullptr
+        ? cudaStreamPerThread : (cudaStream_t)stream;
+    if (target != cudaStreamPerThread) {
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(target, &captureStatus) != cudaSuccess ||
+            captureStatus != cudaStreamCaptureStatusNone) {
+            cudaGetLastError();
+            return false;
+        }
+    }
+    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true,
+                                target, true);
 }
 
 bool FastllmCudaCustomAllReducePairAdd(void *first, void *second, void *dest,
