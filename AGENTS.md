@@ -20,6 +20,26 @@
 十次工具调用全花在"还没好"上；与此同时文档没写、代码没读。等价的时间本可以
 产出实际结果。GPU 测试的墙钟时间是给机器用的，不是给 agent 用来空等的。
 
+## reboot 之前先跑 `tools/safe_reboot.sh`
+
+**这台机器上，GPU 测试进程还活着的时候发 reboot，关机流程会卡住。** 实测（2026-09-17）：
+`systemd-shutdown` 对卡在 NVIDIA 驱动里的进程发 `SIGKILL` 无效（D 状态不可中断），
+于是它反复"等进程"，直到硬件 watchdog 到点才复位。默认 `RebootWatchdogSec=10min`，
+所以表现是"卡住 10 分钟"，不是死机。
+
+**规约**：reboot 之前先跑
+
+```sh
+tools/safe_reboot.sh              # 只报告：目标进程 / GPU 占用 / D 状态进程 / watchdog 值
+tools/safe_reboot.sh --clean      # 停掉这类进程并验证，不重启
+tools/safe_reboot.sh --reboot     # 清理 + 重启；仍有杀不掉的进程时走紧急路径
+```
+
+默认**不动手**。它会列出还可能挡住关机的进程，并在杀不掉时明确告诉你"这次 reboot 会等
+watchdog"。想把最坏等待也压掉，用 `--watchdog-sec 120` 把 `RebootWatchdogSec` 降下来。
+
+根因与验证方式见 `docs/gpu_box_reboot_hang.md`。
+
 ## GPU 测试必须用看门狗包住
 
 **任何会在 GPU 上跑的东西，都必须用 `tools/gpu_watchdog.sh` 包一层。** 不只是多卡
