@@ -4090,7 +4090,13 @@ namespace fastllm {
                     // SM70 长 prefill 会在 warmup 后首次增长 chunked-attention /
                     // dequant scratch。真实 cudaMalloc 只同步当前 GPU，无法排空
                     // 其它 rank 的在途 NCCL，会跨卡死锁。保持 ForceSync。
-                    if (FastllmCudaRuntimeArch() >= 75) {
+                    // FASTLLM_SM70_NCCL_ASYNC=1 是给并发实验用的逃生门，覆盖上面这条
+                    // SM70 保护（见 docs/sm70_4x200k_rotate_plan.md §8）。
+                    const char *sm70Async = std::getenv("FASTLLM_SM70_NCCL_ASYNC");
+                    const bool sm70Override =
+                        sm70Async != nullptr && sm70Async[0] != '\0' &&
+                        strcmp(sm70Async, "0") != 0;
+                    if (FastllmCudaRuntimeArch() >= 75 || sm70Override) {
                         FastllmCudaSetNcclForceSync(false);
                     }
                 };

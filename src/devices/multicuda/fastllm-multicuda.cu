@@ -25,6 +25,7 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
 #include "devices/multicuda/ncclsubmitrendezvous.h"
+#include "devices/multicuda/pcie_ipc_ar.h"
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
@@ -2218,6 +2219,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     }
     if (ready) {
         FastllmCudaCustomAllReduceInit(uniqueDevices);
+        fastllm::pcieipc::Init(uniqueDevices);
         return true;
     }
 
@@ -2226,6 +2228,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // every rank will consistently reject the stale state and use NCCL.
     g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
     FastllmCudaCustomAllReduceReset();
+    fastllm::pcieipc::Shutdown();
     g_ncclSubmitRendezvous.reset();
 
     for (auto &it : g_ncclComms) {
@@ -2273,6 +2276,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 通知 CUDA 分配器：NCCL 已激活。此后真实 cudaMalloc 前会先排空在途集合通信，
     // 避免 cudaMalloc 与 NCCL 主机 proxy 争用 CUDA 驱动锁导致的跨 rank 死锁。
     FastllmCudaSetNcclActive(true);
+    fastllm::pcieipc::Init(uniqueDevices);
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
 }
@@ -2461,6 +2465,343 @@ static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
     if (captureStatus != cudaStreamCaptureStatusNone) {
         return false;
     }
+    return true;
+}
+
+// R1: forward declaration -- the definition lives next to the other collectives.
+void FastllmNcclAllReduceOnStream(void* data, void* dest, int count,
+                                  int dataType, int deviceId,
+                                  void *stream);
+
+// ---------------------------------------------------------------- R1 primitives
+//
+// R1 = put the row-parallel all-reduce on its own stream so it can overlap the
+// next operator's GEMM, instead of queueing behind it on the compute stream.
+//
+// The catch on SM70 is FastllmCudaGetNcclForceSync(): it stays true for the whole
+// run (basellm.cpp only clears it for arch >= 75), so every collective is
+// followed by a host cudaStreamSynchronize. A side stream alone therefore buys
+// nothing -- which is exactly why the earlier "move the AR to another stream"
+// attempts measured zero. The two pieces below are the minimum needed to make a
+// side-stream AR actually overlap:
+//
+//   1. a dedicated per-(device,thread) side stream with events, so the AR can be
+//      ordered after its own GEMM without blocking the host, and
+//   2. a post-sync that syncs the *side* stream (or the side stream's completion
+//      event) instead of doing a host-wide wait that would re-serialize.
+//
+// Guarded by FASTLLM_TP_AR_SIDE_STREAM (default off) so the default path is
+// bit-for-bit the old one.
+
+namespace {
+
+struct TpAllReduceSideStream {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  ready = nullptr;     // compute stream finished the GEMM
+    cudaEvent_t  done = nullptr;      // this collective finished
+    int          device = -1;
+    bool         usable = false;
+};
+
+// One side stream per (device, host thread): the TP reduce runs on the same
+// thread that issued the GEMM, so a thread_local map is the right scope.
+TpAllReduceSideStream &GetTpAllReduceSideStream(int device) {
+    static thread_local std::map<int, TpAllReduceSideStream> cache;
+    TpAllReduceSideStream &entry = cache[device];
+    if (entry.stream == nullptr && entry.device != device) {
+        int previous = 0;
+        cudaGetDevice(&previous);
+        if (cudaSetDevice(device) != cudaSuccess) {
+            cudaGetLastError();
+            return entry;
+        }
+        cudaError_t state = cudaStreamCreateWithFlags(
+            &entry.stream, cudaStreamNonBlocking);
+        if (state == cudaSuccess) {
+            state = cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming);
+        }
+        if (state == cudaSuccess) {
+            state = cudaEventCreateWithFlags(&entry.done, cudaEventDisableTiming);
+        }
+        cudaSetDevice(previous);
+        if (state == cudaSuccess) {
+            entry.device = device;
+            entry.usable = true;
+        } else {
+            cudaGetLastError();
+            if (entry.stream != nullptr) {
+                cudaStreamDestroy(entry.stream);
+                entry.stream = nullptr;
+            }
+            if (entry.ready != nullptr) {
+                cudaEventDestroy(entry.ready);
+                entry.ready = nullptr;
+            }
+        }
+    }
+    return entry;
+}
+
+bool TpAllReduceSideStreamEnabled() {
+    static const bool enabled = []() {
+        const char *v = std::getenv("FASTLLM_TP_AR_SIDE_STREAM");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+               strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+    }();
+    return enabled;
+}
+
+// Diagnostic gate for the side-stream route's 7% regression. With the drain
+// restored the route becomes "NCCL on another stream, still drained after every
+// collective", which separates the missing drain from the stream change itself.
+// Default off keeps the shipped behaviour.
+bool TpArSideStreamHostSyncRequested() {
+    static const bool on = []() {
+        const char *v = std::getenv("FASTLLM_TP_AR_SIDE_STREAM_HOST_SYNC");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+// R5: let the custom one-stage all-reduce run on a caller-chosen stream so an
+// overlapped collective can use it.
+//
+// DO NOT ENABLE. Measured 2026-09-16: at 8K it is 13.2% slower than the same
+// configuration without it, and at 80K it faults. The 80K run ended in
+// cudaErrorIllegalAddress (exit 134) and produced 327 new kernel-log lines:
+// Xid 13 "Graphics SM Warp Exception ... Out Of Range Address" on GPUs 0/1/3
+// plus Xid 43 channel teardown. The custom kernel is fine on the thread's
+// default stream (forced custom all-reduce at 80K with R1 off runs clean), so
+// the fault is specific to a non-default stream. Kept, default off, only so the
+// failure stays reproducible; see docs/sm70_4x200k_rotate_plan.md section 8.8.
+bool TpArSideStreamCustomArRequested() {
+    static const bool on = []() {
+        const char *v = std::getenv("FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+} // namespace
+
+// Engagement counter so a run can prove the side-stream path was actually
+// taken (printed once at exit when the gate is on). Without this, a silent
+// fallback looks identical to a working overlap.
+static std::atomic<long> g_tpArSideStreamUses{0};
+
+// Per-size census of the engine's own TP all-reduce (FASTLLM_NCCL_AR_STATS=1).
+// The point is that both terms are now observations: the byte count is the actual
+// `count * typeBytes` argument handed to ncclAllReduce, and the time is measured
+// around submission plus the per-collective host sync that SM70 always performs.
+// Earlier attempts at this number divided an observed time by a byte count derived
+// from the ring formula, which is an estimate, not a measurement.
+struct ArStatsSlot {
+    std::atomic<long> count{0};
+    std::atomic<long> bytes{0};      // total bytes replayed through this size
+    std::atomic<long> nanos{0};      // total observed time
+};
+static ArStatsSlot g_arStats[40];      // drained: time is the collective's completion
+static ArStatsSlot g_arStatsAsync[40]; // not drained: time is submission only
+// Where the drained time goes. Waiting for the SLOWEST rank is host time that is not
+// communication, so it has to be separated out before any bandwidth claim.
+static std::atomic<long> g_arPhaseNanos[4];  // 0=pre-rendezvous 1=submit 2=post 3=drain
+
+static bool ArStatsEnabled() {
+    static const bool on = []() {
+        const char *v = std::getenv("FASTLLM_NCCL_AR_STATS");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static int ArStatsBucket(long bytes) {
+    int b = 0;
+    while ((1L << b) < bytes && b < 39) {
+        ++b;
+    }
+    return b;
+}
+
+static void ArStatsReport() {
+    if (!ArStatsEnabled()) {
+        return;
+    }
+    auto dump = [](const char *title, ArStatsSlot *tbl) {
+        std::fprintf(stderr, "[Fastllm] TP all-reduce census (%s). counts and times are\n"
+                             "          SUMMED OVER ALL RANK THREADS in this process; divide by\n"
+                             "          the rank count for a per-rank figure.\n"
+                             "  %-12s %8s %10s %12s %10s %10s\n",
+                     title, "bytes", "calls", "total ms", "mean us", "busbw GB/s",
+                     "oneway GB/s");
+        for (int b = 0; b < 40; ++b) {
+            long n = tbl[b].count.load();
+            if (n == 0) {
+                continue;
+            }
+            long by = tbl[b].bytes.load();
+            long ns = tbl[b].nanos.load();
+            double sec = ns / 1e9;
+            double oneway = sec > 0 ? (double)by / sec / 1e9 : 0.0;
+            double ring = oneway * 1.5;   // R=4: 2*(R-1)/R = 1.5
+            std::fprintf(stderr, "  %-12ld %8ld %10.1f %12.2f %10.2f %10.2f\n",
+                         by / (n > 0 ? n : 1), n, ns / 1e6, ns / 1e3 / (double)n,
+                         ring, oneway);
+        }
+    };
+    std::fprintf(stderr,
+        "[Fastllm] TP all-reduce census. 'drained' = submission plus the per-collective\n"
+        "          cudaStreamSynchronize SM70 always performs, so time is completion.\n"
+        "          'async' = the side-stream path that deliberately does not drain, so\n"
+        "          there time is ONLY submission and the rate columns are meaningless.\n");
+    dump("drained", g_arStats);
+    dump("async", g_arStatsAsync);
+    static const char *ph[4] = {"pre-rendezvous(Before)", "submit+After-rendezvous",
+                                "post-sync-setup", "drain(cudaStreamSynchronize)"};
+    long tot = 0;
+    for (int i = 0; i < 4; ++i) {
+        tot += g_arPhaseNanos[i].load();
+    }
+    std::fprintf(stderr, "[Fastllm] drained time split (share of the drained total):\n");
+    for (int i = 0; i < 4; ++i) {
+        long v = g_arPhaseNanos[i].load();
+        std::fprintf(stderr, "  %-32s %10.1f ms  %5.1f%%\n", ph[i], v / 1e6,
+                     tot > 0 ? 100.0 * (double)v / (double)tot : 0.0);
+    }
+    std::fprintf(stderr, "  %-32s %10.1f ms\n", "TOTAL", tot / 1e6);
+    std::fflush(stderr);
+}
+
+static void ArStatsNote(long bytes, long nanos, bool drained) {
+    if (!ArStatsEnabled()) {
+        return;
+    }
+    static const bool once = []() {
+        std::atexit(ArStatsReport);
+        return true;
+    }();
+    (void)once;
+    int b = ArStatsBucket(bytes);
+    ArStatsSlot *tbl = drained ? g_arStats : g_arStatsAsync;
+    tbl[b].count.fetch_add(1, std::memory_order_relaxed);
+    tbl[b].bytes.fetch_add(bytes, std::memory_order_relaxed);
+    tbl[b].nanos.fetch_add(nanos, std::memory_order_relaxed);
+}
+
+static void FastllmTpArSideStreamReport() {
+    if (!TpAllReduceSideStreamEnabled()) {
+        return;
+    }
+    fprintf(stderr, "[Fastllm] TP AR side-stream: %ld collective(s) issued off the compute stream.\n",
+            g_tpArSideStreamUses.load());
+    fflush(stderr);
+}
+
+static void FastllmTpArSideStreamReportOnce() {
+    static const bool registered = []() {
+        std::atexit(FastllmTpArSideStreamReport);
+        return true;
+    }();
+    (void)registered;
+    g_tpArSideStreamUses.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Begin: fork the collective onto the side stream WITHOUT joining it.
+//
+// This mirrors vLLM/DeepSeek-V4's execute_in_parallel (vllm/utils/
+// multi_stream_utils.py): there, the aux streams are launched first and the
+// default stream's own work runs *after* the fan-out, so the default work
+// overlaps the aux work; the join is a bare event wait at the end.
+//
+// The first cut of R1 launched and joined in one call, which is why it could
+// not overlap anything: the caller had no independent work between launch and
+// join. Splitting the two halves is what makes the DSV4 shape expressible here.
+// Diagnostic gate (FASTLLM_TP_AR_DEBUG=1, default off). The chunked pipeline
+// deadlocked in a way that produced no error and no log line at all, so a hang
+// could not be attributed to any single call. These probes print one line per
+// crossing so the last line emitted by each rank names the call it is stuck in.
+static bool TpArDebugEnabled() {
+    static const bool enabled = []() {
+        const char *v = std::getenv("FASTLLM_TP_AR_DEBUG");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+static std::atomic<long> g_tpArDebugSeq[16];
+
+#define TP_AR_PROBE(dev, phase)                                                \
+    do {                                                                       \
+        if (TpArDebugEnabled()) {                                              \
+            int d_ = (dev);                                                    \
+            long s_ = (d_ >= 0 && d_ < 16)                                     \
+                          ? g_tpArDebugSeq[d_].fetch_add(1, std::memory_order_relaxed) \
+                          : -1;                                            \
+            fprintf(stderr, "[R1dbg] dev=%d seq=%ld %s\n", d_, s_, (phase));   \
+            fflush(stderr);                                                    \
+        }                                                                      \
+    } while (0)
+
+bool FastllmBeginTpAllReduceSideStream(void *data, void *dest, int count,
+                                       int dataType, int deviceId) {
+    if (!TpAllReduceSideStreamEnabled()) {
+        return false;
+    }
+    TP_AR_PROBE(deviceId, "B:enter");
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus) != cudaSuccess ||
+        captureStatus != cudaStreamCaptureStatusNone) {
+        cudaGetLastError();
+        return false;
+    }
+    TpAllReduceSideStream &side = GetTpAllReduceSideStream(deviceId);
+    if (!side.usable) {
+        return false;
+    }
+    TP_AR_PROBE(deviceId, "B:stream-ready");
+    // fan-out: the side stream waits for everything already enqueued on the
+    // caller's thread stream (so this collective reads finished inputs)...
+    if (cudaEventRecord(side.ready, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamWaitEvent(side.stream, side.ready, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    TP_AR_PROBE(deviceId, "B:fanned-out");
+    TP_AR_PROBE(deviceId, "B:launching");
+    FastllmNcclAllReduceOnStream(data, dest, count, dataType, deviceId, side.stream);
+    TP_AR_PROBE(deviceId, "B:launched");
+    // ...and we remember completion for the later join. The caller's stream is
+    // deliberately NOT made to wait here, so the caller can keep issuing
+    // independent work that overlaps this transfer.
+    if (cudaEventRecord(side.done, side.stream) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    TP_AR_PROBE(deviceId, "B:done-recorded");
+    FastllmTpArSideStreamReportOnce();
+    return true;
+}
+
+// Join: order the caller's stream after the last Begin'd collective. Pure
+// device-side event wait, so the host never blocks (the DSV4 `ev.wait()`).
+void FastllmEndTpAllReduceSideStream(int deviceId) {
+    TpAllReduceSideStream &side = GetTpAllReduceSideStream(deviceId);
+    if (!side.usable) {
+        return;
+    }
+    TP_AR_PROBE(deviceId, "E:waiting");
+    if (cudaStreamWaitEvent(cudaStreamPerThread, side.done, 0) != cudaSuccess) {
+        cudaGetLastError();
+    }
+    TP_AR_PROBE(deviceId, "E:done");
+}
+
+// One-shot form (Begin+End), kept for callers that have nothing to overlap.
+bool FastllmTryNcclAllReduceOnSideStream(void *data, void *dest, int count,
+                                        int dataType, int deviceId) {
+    if (!FastllmBeginTpAllReduceSideStream(data, dest, count, dataType, deviceId)) {
+        return false;
+    }
+    FastllmEndTpAllReduceSideStream(deviceId);
     return true;
 }
 
@@ -3098,13 +3439,66 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
 static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
                                     int dataType, int deviceId,
-                                    bool allowCustomAllReduce) {
+                                    bool allowCustomAllReduce,
+                                    cudaStream_t stream = cudaStreamPerThread,
+                                    bool skipHostPostSync = false) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
+    // Census (FASTLLM_NCCL_AR_STATS=1): time each collective around submission plus
+    // the SM70 per-collective drain, so the observed time is that collective's own
+    // completion time and the byte count is this call's own argument. Both terms are
+    // observations; earlier attempts divided an observed time by a ring-formula byte
+    // count, which is an estimate.
+    const bool arStats = ArStatsEnabled();
+    const auto arStart = arStats ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point();
+    auto now = []() { return std::chrono::steady_clock::now(); };
+    auto arPhases = arStats;
+    auto recordAr = [&](bool drained) {
+        if (!arStats) {
+            return;
+        }
+        long ns = (long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - arStart)
+                      .count();
+        ArStatsNote((long)count * (long)FastllmNcclDataTypeBytes(dataType), ns, drained);
+    };
 
+    // The custom one-stage kernel is eligible on a caller-chosen stream too
+    // (FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1), so an overlapped collective can
+    // use it. Off by default: the engine's own auto-test on this box keeps TP>=4
+    // tensors of 40 KiB and up on NCCL, and the candidate also declines anything
+    // over CustomArMaxBytes(), so switching this on only pays if a measurement
+    // says so.
+    const bool defaultStream = (stream == cudaStreamPerThread);
     if (allowCustomAllReduce &&
-        FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
+        (defaultStream || TpArSideStreamCustomArRequested()) &&
+        FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId,
+                                   defaultStream ? nullptr : (void *)stream)) {
+        return;
+    }
+
+    // FlashInfer's PCIe one-shot all-reduce (FASTLLM_PCIE_IPC_AR=1, default off).
+    // Measured on this box it beats NCCL only below the 160 KiB..512 KiB crossover,
+    // so fastllm::pcieipc::TryAllReduce refuses anything larger and returns false
+    // without side effects, letting the call continue to NCCL below. It is only
+    // offered on the default stream because the glue launches on
+    // cudaStreamPerThread; an overlapped side-stream call must not silently land on
+    // a different stream than its caller is ordering against.
+    if (defaultStream && allowCustomAllReduce &&
+        fastllm::pcieipc::TryAllReduce(data, dest, count, dataType, deviceId)) {
+        // The kernel was launched, but returning here would skip the per-collective
+        // host drain that the rest of this function performs. On SM70 that drain is
+        // load-bearing: the comment on the NCCL path below explains that a collective
+        // left in flight while another thread takes the CUDA driver lock deadlocks
+        // across ranks. Do the same drain here before returning.
+        if (!skipHostPostSync && FastllmNcclPostSyncEnabled(stream)) {
+            cudaError_t syncState = cudaStreamSynchronize(stream);
+            checkCudaErrors(
+                "Error: CUDA error when synchronizing pcie_ipc allreduce!", syncState);
+        }
+        recordAr(true);
         return;
     }
 
@@ -3151,7 +3545,6 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
 
     // 3. 执行 AllReduce
     // op: ncclSum (求和)
-    cudaStream_t stream = cudaStreamPerThread;
     auto *rendezvous = g_ncclSubmitRendezvous.get();
     int rank = -1;
     if (rendezvous != nullptr) {
@@ -3190,6 +3583,7 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) {
         return;
     }
+    auto tBefore = now();
     // 注意：ncclAllReduce 发射是异步的
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
@@ -3204,13 +3598,41 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) {
         return;
     }
+    auto tAfter = now();
+    // 分段：进入 Before 汇合前的主机时间 / 汇合与提交 / 后汇合 / 之后的排空
+    if (arPhases) {
+        g_arPhaseNanos[0].fetch_add(
+            (long)std::chrono::duration_cast<std::chrono::nanoseconds>(tBefore - arStart).count(),
+            std::memory_order_relaxed);
+        g_arPhaseNanos[1].fetch_add(
+            (long)std::chrono::duration_cast<std::chrono::nanoseconds>(tAfter - tBefore).count(),
+            std::memory_order_relaxed);
+    }
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
     // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
     // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
-    if (FastllmNcclPostSyncEnabled(stream)) {
+    //
+    // R1 (skipHostPostSync): 当调用方是同线程的 side-stream 路径时，主机必须能继续往下发射
+    // 下一个算子，否则重叠无从谈起；此时完成语义改由 side 流的 completion event 承担
+    // （见 FastllmTryNcclAllReduceOnSideStream），而"在途集合通信 vs 真实 cudaMalloc"这条
+    // 竞态由 FastllmCudaCheckedMalloc 里既有的 fastllmCudaNcclActive 排空逻辑兜底。
+    auto tSetup = now();
+    if (!skipHostPostSync && FastllmNcclPostSyncEnabled(stream)) {
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
+        if (arPhases) {
+            g_arPhaseNanos[2].fetch_add(
+                (long)std::chrono::duration_cast<std::chrono::nanoseconds>(tSetup - tAfter).count(),
+                std::memory_order_relaxed);
+            g_arPhaseNanos[3].fetch_add(
+                (long)std::chrono::duration_cast<std::chrono::nanoseconds>(now() - tSetup).count(),
+                std::memory_order_relaxed);
+        }
+        recordAr(true);      // 已排空：这段耗时就是该次集合通信的完成时间
+        return;
     }
+    // 异步路径（side-stream，刻意不排空）：这里只能测到"发射"耗时，不是完成时间。
+    recordAr(false);
 }
 
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
@@ -3220,6 +3642,24 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
                                   int dataType, int deviceId) {
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
+}
+
+// R1: same collective, but enqueued on an explicit stream and (by default)
+// without the host post-sync, so the caller can keep submitting work on its own
+// stream. FASTLLM_TP_AR_SIDE_STREAM_HOST_SYNC=1 restores the drain; that is a
+// diagnostic, not a mode anyone should ship.
+//
+// R5: allowCustomAllReduce is false here by default, which is why the custom
+// one-stage kernel was previously unreachable from an overlapped collective no
+// matter what FASTLLM_CUDA_CUSTOM_ALLREDUCE said. FASTLLM_TP_AR_CUSTOM_AR_ON_SIDE_STREAM=1
+// opens it; the candidate's own size cap and policy still apply underneath.
+void FastllmNcclAllReduceOnStream(void* data, void* dest, int count,
+                                  int dataType, int deviceId,
+                                  void *stream) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId,
+                             TpArSideStreamCustomArRequested(),
+                             (cudaStream_t)stream,
+                             !TpArSideStreamHostSyncRequested());
 }
 
 bool FastllmNcclAllGather(const void* data, void* dest, int count,

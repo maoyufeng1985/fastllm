@@ -6,7 +6,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <string>
+#include <array>
+#include <atomic>
 #include <vector>
 
 #ifdef USE_CUDA
@@ -154,7 +157,40 @@ namespace fastllm {
             std::swap(live->expansionSize, alt->expansionSize);
             std::swap(live->expansionBytes, alt->expansionBytes);
         }
+
+        // R1: same collective, but issued on the side stream so the host is not
+        // blocked and the next operator on the caller's stream can be enqueued
+        // while this transfer is in flight. Returns false when the side-stream
+        // path is unavailable, so the caller falls back to AllReduce().
+        bool AllReduceOnSideStream(int gpuId) {
+            PrepareAlt(gpuId);
+            if (!FastllmTryNcclAllReduceOnSideStream(
+                    live->cudaData, alt->cudaData,
+                    live->Count(0), live->dataType, gpuId)) {
+                return false;
+            }
+            std::swap(live->cudaData, alt->cudaData);
+            std::swap(live->expansionSize, alt->expansionSize);
+            std::swap(live->expansionBytes, alt->expansionBytes);
+            return true;
+        }
     };
+
+    // R1: minimum tensor size for the side-stream path. Decode tensors are tiny
+    // (batch x hidden) and rely on the custom one-stage kernel; only prefill
+    // sized tensors are worth a separate stream.
+    inline int Qwen3CudaTpSideStreamMinElements() {
+        static const int minElements = []() {
+            const char *v = std::getenv("FASTLLM_TP_AR_SIDE_STREAM_MIN_ELEMENTS");
+            if (v == nullptr || v[0] == '\0') {
+                return 1024 * 1024;   // 1M elements ~= 2 MB fp16
+            }
+            char *end = nullptr;
+            long value = std::strtol(v, &end, 10);
+            return (end == v || value <= 0) ? (1024 * 1024) : (int)value;
+        }();
+        return minElements;
+    }
 
     inline void Qwen3CudaTpAllReduce(Data &tensor, int gpuId,
                                     Qwen3CudaTpReducePingPong *ping,
@@ -164,6 +200,23 @@ namespace fastllm {
                 tensor.cudaData, tensor.cudaData,
                 tensor.Count(0), tensor.dataType, gpuId);
             return;
+        }
+        // R1 (FASTLLM_TP_AR_SIDE_STREAM, default off): enqueue this collective on a
+        // per-(device,thread) side stream so the host is not blocked here and the
+        // network transfer can proceed while the caller keeps submitting work on
+        // its own stream. The caller's stream is ordered after the collective by
+        // an event, so dependencies are preserved without a host wait.
+        if (tensor.cudaData != nullptr &&
+            (uint64_t)tensor.Count(0) >= (uint64_t)Qwen3CudaTpSideStreamMinElements()) {
+            if (ping != nullptr && ping->live == &tensor) {
+                if (ping->AllReduceOnSideStream(gpuId)) {
+                    return;
+                }
+            } else if (FastllmTryNcclAllReduceOnSideStream(
+                           tensor.cudaData, tensor.cudaData,
+                           tensor.Count(0), tensor.dataType, gpuId)) {
+                return;
+            }
         }
         if (ping != nullptr && ping->live == &tensor) {
             ping->AllReduce(gpuId);
@@ -948,6 +1001,343 @@ namespace fastllm {
         }
     }
 
+    // ---------- R1: chunked projection + all-reduce pipeline ----------
+    //
+    // Reference: vLLM / DeepSeek-V4 `execute_in_parallel`
+    // (vllm/utils/multi_stream_utils.py:113-127). The load-bearing detail there
+    // is the ORDER: the auxiliary streams are launched first, the default
+    // stream's own work runs AFTER the fan-out, and the join is a bare event
+    // wait. Overlap exists because the caller has independent work in flight
+    // while the auxiliary stream runs.
+    //
+    // Mapped here onto FastLLM's NVFP4 row-parallel down projection: split the
+    // token dimension into `splits` chunks and issue
+    //
+    //     chunk c:  GEMM_c (compute stream) -> AddTo residual_c -> fork(AR_c)
+    //     chunk c+1: GEMM_{c+1} runs on the compute stream WHILE AR_c flies
+    //
+    // and join once at the end. The host never blocks inside the loop.
+    //
+    // Why the split is mandatory rather than optional: the all-reduce result
+    // feeds the next layer, so with a single un-split collective the caller has
+    // nothing independent to run between fork and join and the "side stream"
+    // buys exactly zero. (Measured: an earlier one-piece version left wall clock
+    // flat and device concurrency at 1.)
+    //
+    // Numerics: chunking changes the summation order of the reduction, so the
+    // token hash is NOT guaranteed identical to the un-split collective. That is
+    // a real property of this route, not an implementation detail.
+    inline bool Qwen3CudaTpArPipelineEnabled() {
+        static const bool enabled = []() {
+            const char *v = std::getenv("FASTLLM_TP_AR_SIDE_STREAM_PIPELINE");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 &&
+                   std::strcmp(v, "false") != 0 && std::strcmp(v, "off") != 0;
+        }();
+        return enabled;
+    }
+
+    inline int Qwen3CudaTpArPipelineSplits() {
+        static const int splits = []() {
+            const char *v = std::getenv("FASTLLM_TP_AR_SIDE_STREAM_SPLITS");
+            if (v == nullptr || v[0] == '\0') {
+                return 4;
+            }
+            char *end = nullptr;
+            long value = std::strtol(v, &end, 10);
+            return (end == v || value < 2 || value > 64) ? 4 : (int)value;
+        }();
+        return splits;
+    }
+
+    // Number of contiguous rows when the tensor is viewed as (rows, lastDim).
+    // Works for 2-D [rows, k] and for N-D activations such as [batch, seq, k]:
+    // everything except the last dimension is flattened, which is exact for a
+    // row-major contiguous tensor.
+    inline int Qwen3CudaFlattenedRowCount(const Data &src) {
+        if (src.dims.empty() || src.dims.back() <= 0) {
+            return 0;
+        }
+        return (int)(src.Count(0) / (uint64_t)src.dims.back());
+    }
+
+    // Contiguous row slice of a row-major CUDA tensor, borrowed (FakeFrom) so
+    // there is no copy and no extra allocation. The view is always published as
+    // 2-D {rows, lastDim}; that is the same memory either way, and it keeps the
+    // borrowed output small enough for the graph pools to ignore.
+    inline bool Qwen3CudaMakeRowSliceView(const Data &src, int startRow, int rows,
+                                          Data &view) {
+        if (src.dims.empty() || src.cudaData == nullptr ||
+            src.dataDevice != DataDevice::CUDA ||
+            startRow < 0 || rows <= 0) {
+            return false;
+        }
+        int totalRows = Qwen3CudaFlattenedRowCount(src);
+        if (totalRows <= 0 || startRow + rows > totalRows) {
+            return false;
+        }
+        int cols = src.dims.back();
+        // The slice is contiguous only if the tensor is row-major contiguous.
+        if (src.strides.size() != src.dims.size() ||
+            src.strides.back() != 1) {
+            return false;
+        }
+        for (int i = 0; i + 1 < (int)src.dims.size(); ++i) {
+            if (src.strides[i] != src.strides[i + 1] * (uint64_t)src.dims[i + 1]) {
+                return false;
+            }
+        }
+        size_t byteNumerator = (size_t)startRow * (size_t)cols * src.unitSize;
+        if (src.unitSizeDiv == 0 || byteNumerator % src.unitSizeDiv != 0) {
+            return false;
+        }
+        view.FakeFrom(src, byteNumerator / src.unitSizeDiv);
+        view.dataDeviceIds = src.dataDeviceIds;
+        view.Resize({rows, cols});
+        return true;
+    }
+
+    // Engagement counters. A silent fallback is indistinguishable from a
+    // working pipeline in the logs, so a run must be able to PROVE the path was
+    // taken (and, when it was not, why). Printed once at exit under the gate.
+    inline std::atomic<long> &Qwen3CudaTpArPipelineUses() {
+        static std::atomic<long> uses{0};
+        return uses;
+    }
+    // Probe gate (FASTLLM_TP_AR_DEBUG=1, default off). The chunked pipeline
+    // deadlocked with no error and no output, so the stalls could not be
+    // attributed to a call. One line per crossing leaves, per rank, a last line
+    // that names where it stopped.
+    inline bool Qwen3CudaTpArDebugEnabled() {
+        static const bool enabled = []() {
+            const char *v = std::getenv("FASTLLM_TP_AR_DEBUG");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        return enabled;
+    }
+    inline std::atomic<long> &Qwen3CudaTpArPipelineRejects() {
+        static std::atomic<long> rejects{0};
+        return rejects;
+    }
+    inline std::string &Qwen3CudaTpArPipelineLastReject() {
+        static std::string reason;
+        return reason;
+    }
+    // Per-rank reject counter. A reject that happens on SOME ranks but not
+    // others desyncs the collectives and deadlocks, so the reason has to be
+    // attributable to a device -- a single process-wide counter hides that.
+    inline std::atomic<long> &Qwen3CudaTpArPipelineRejectsOn(int rank) {
+        static std::atomic<long> perRank[16];
+        return perRank[((unsigned)rank) & 15u];
+    }
+    inline void Qwen3CudaTpArPipelineNoteReject(const char *why, int rank) {
+        Qwen3CudaTpArPipelineRejects().fetch_add(1, std::memory_order_relaxed);
+        Qwen3CudaTpArPipelineLastReject() = why;
+        // Print the first few fallbacks eagerly, per rank: an atexit-only report
+        // vanishes if the run never reaches a successful pipeline call at all,
+        // which is exactly the state that needs diagnosing.
+        long n = Qwen3CudaTpArPipelineRejectsOn(rank).fetch_add(
+            1, std::memory_order_relaxed);
+        if (n < 2) {
+            fprintf(stderr, "[Fastllm] TP AR chunked pipeline: dev=%d fell back (%s)\n",
+                    rank, why);
+            fflush(stderr);
+        }
+    }
+    inline void Qwen3CudaTpArPipelineReport() {
+        if (!Qwen3CudaTpArPipelineEnabled()) {
+            return;
+        }
+        fprintf(stderr,
+                "[Fastllm] TP AR chunked pipeline: engaged=%ld, fell back=%ld"
+                " (last reason: %s)\n",
+                Qwen3CudaTpArPipelineUses().load(),
+                Qwen3CudaTpArPipelineRejects().load(),
+                Qwen3CudaTpArPipelineLastReject().empty()
+                    ? "-" : Qwen3CudaTpArPipelineLastReject().c_str());
+        fflush(stderr);
+    }
+    inline bool Qwen3CudaTpArPipelineReportRegistered() {
+        static const bool once = []() {
+            std::atexit(Qwen3CudaTpArPipelineReport);
+            return true;
+        }();
+        return once;
+    }
+
+    // Chunked form of the row-parallel reduce for the generic (non-FP8-fused)
+    // path, which is what the NVFP4 checkpoints actually take.
+    //
+    // RANK SYMMETRY IS THE WHOLE BALL GAME HERE. The loop below forks one
+    // collective per chunk, so every rank must fork the SAME number of
+    // collectives of the SAME size. NCCL matches collectives by position: if one
+    // rank forks 4 and a peer forks 1, position 2 pairs a chunk-sized reduce with
+    // a full-sized one and the job hangs with no error. So the engagement
+    // decision must be a function of state that is IDENTICAL on every rank, and
+    // `middle` is NOT such a state:
+    //
+    //   `middle` (= buf.mlpPart) is only ever created by the un-split fallback's
+    //   `firstTensorParallelRank` branch (LinearAdd). On the other ranks that
+    //   fallback writes straight into the residual, so their `middle` keeps
+    //   EMPTY dims for the whole run.
+    //
+    // Gating on `middle.dims` therefore let exactly one rank in -- measured:
+    // 26 pipeline calls, all on device 0, zero on devices 1..3 -- and the run
+    // deadlocked 45 s in with one GPU at 0% and the other three at 100%.
+    //
+    // The gate below uses only replicated state: `hiddenStates` (the residual,
+    // identical on every rank) and the environment. `middle` is Sized here, to
+    // the layout the loop needs, before any collective is forked.
+    inline bool Qwen3CudaTryTpChunkedLinearResidualReducePipeline(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, Data &weight, Data &bias,
+            Data &middle, Data &hiddenStates,
+            bool firstTensorParallelRank,
+            int gpuId) {
+        if (!Qwen3CudaTpArPipelineEnabled()) {
+            return false;
+        }
+        // Graph capture pins pointer tables: borrowed stack views would dangle
+        // on replay. Never take this route while capturing.
+        if (GetFastllmEnv().cudaGraph || FastllmCudaGraphIsCapturingFast()) {
+            Qwen3CudaTpArPipelineNoteReject("cudaGraph/capturing", gpuId);
+            return false;
+        }
+        // ---- rank-invariant gate: replicated tensors and the environment only
+        if (input.dataType != hiddenStates.dataType ||
+            !bias.dims.empty() || hiddenStates.dims.empty() ||
+            weight.dims.size() != 2 ||
+            hiddenStates.dims.back() != weight.dims[0]) {
+            Qwen3CudaTpArPipelineNoteReject("dtype/shape mismatch", gpuId);
+            if (Qwen3CudaTpArDebugEnabled()) {
+                static std::atomic<long> dumps[16];
+                if (dumps[((unsigned)gpuId) & 15u].fetch_add(
+                        1, std::memory_order_relaxed) < 3) {
+                    auto dimsOf = [](const Data &d) {
+                        std::string s;
+                        for (size_t i = 0; i < d.dims.size(); ++i) {
+                            s += (i ? "," : "");
+                            s += std::to_string(d.dims[i]);
+                        }
+                        return s.empty() ? std::string("-") : s;
+                    };
+                    fprintf(stderr,
+                            "[R1dbg-shape] dev=%d in=[%s]dt=%d mid=[%s]dt=%d "
+                            "res=[%s]dt=%d w=[%s] bias=%d\n",
+                            gpuId,
+                            dimsOf(input).c_str(), (int)input.dataType,
+                            dimsOf(middle).c_str(), (int)middle.dataType,
+                            dimsOf(hiddenStates).c_str(), (int)hiddenStates.dataType,
+                            dimsOf(weight).c_str(), (int)bias.dims.size());
+                    fflush(stderr);
+                }
+            }
+            return false;
+        }
+        // Rows are flattened over every leading dimension; each slice must line
+        // up with the same flattened range in every tensor. Row counts come from
+        // the residual and its input, both replicated.
+        int rows = Qwen3CudaFlattenedRowCount(hiddenStates);
+        if (rows <= 0 || Qwen3CudaFlattenedRowCount(input) != rows) {
+            Qwen3CudaTpArPipelineNoteReject("row-count mismatch", gpuId);
+            return false;
+        }
+        int splits = Qwen3CudaTpArPipelineSplits();
+        if (splits < 2 || rows < splits || (rows % splits) != 0) {
+            Qwen3CudaTpArPipelineNoteReject("rows not divisible by splits", gpuId);
+            return false;
+        }
+        int chunk = rows / splits;
+        // The collective must stay on a size where the side-stream path is
+        // worthwhile; tiny decode-shaped slices would just add event overhead.
+        if ((uint64_t)chunk * (uint64_t)hiddenStates.dims.back() <
+            (uint64_t)Qwen3CudaTpSideStreamMinElements()) {
+            Qwen3CudaTpArPipelineNoteReject("slice below min elements", gpuId);
+            return false;
+        }
+        // Give `middle` the layout the loop needs. The un-split fallback only
+        // assigns it on the first TP rank, so on every other rank it arrives here
+        // EMPTY; sizing it is the same thing that fallback does, just done for
+        // all ranks. It happens before any collective is forked, so a rank that
+        // has to allocate cannot desync the collective sequence.
+        if (middle.dims != std::vector<int>{rows, (int)hiddenStates.dims.back()} ||
+            middle.dataType != hiddenStates.dataType) {
+            Qwen3CudaPrepareLocalOutput(middle, gpuId);
+            middle.dataType = hiddenStates.dataType;
+            middle.UpdateUnitSize();
+            middle.dataDevice = DataDevice::CUDA;
+            middle.dataDeviceIds = {gpuId};
+            middle.Resize({rows, (int)hiddenStates.dims.back()});
+            middle.Allocate(false);
+        }
+        // Validate EVERY slice before touching anything. The loop below mutates
+        // `hiddenStates` and forks collectives, so bailing out midway would leave
+        // a partially reduced tensor that the caller's fallback applies again.
+        for (int c = 0; c < splits; ++c) {
+            Data inView, midView, resView;
+            if (!Qwen3CudaMakeRowSliceView(input, c * chunk, chunk, inView) ||
+                !Qwen3CudaMakeRowSliceView(middle, c * chunk, chunk, midView) ||
+                !Qwen3CudaMakeRowSliceView(hiddenStates, c * chunk, chunk, resView)) {
+                Qwen3CudaTpArPipelineNoteReject("slice view not contiguous", gpuId);
+                return false;
+            }
+        }
+        int subCount = 0;   // elements per collective, checked for rank symmetry
+        for (int c = 0; c < splits; ++c) {
+            Data inView, midView, resView;
+            if (!Qwen3CudaMakeRowSliceView(input, c * chunk, chunk, inView) ||
+                !Qwen3CudaMakeRowSliceView(middle, c * chunk, chunk, midView) ||
+                !Qwen3CudaMakeRowSliceView(hiddenStates, c * chunk, chunk, resView)) {
+                return false;   // unreachable: validated above, kept as a guard
+            }
+            // GEMM_c into the borrowed middle slice.
+            if (Qwen3CudaTpArDebugEnabled()) {
+                fprintf(stderr, "[R1dbg-p] dev=%d P:gemm chunk=%d/%d\n",
+                        gpuId, c, splits);
+                fflush(stderr);
+            }
+            runner.Run("Linear",
+                       DataDict{{"input", &inView}, {"weight", &weight},
+                                {"bias", &bias}, {"output", &midView}},
+                       FloatDict(), IntDict(), {"output"}, true, true);
+            // Assemble this chunk's partial residual exactly as the un-split
+            // path does: the owning rank accumulates, the others overwrite.
+            if (firstTensorParallelRank) {
+                Qwen3CudaAddTo(runner, resView, midView, 1.0f);
+            } else {
+                FastllmCudaCopyFromDeviceToDevice(
+                    resView.cudaData, midView.cudaData, resView.GetBytes());
+            }
+            // Fork the collective; the next chunk's GEMM overlaps it.
+            int chunkCount = (int)resView.Count(0);
+            if (Qwen3CudaTpArDebugEnabled()) {
+                fprintf(stderr, "[R1dbg-p] dev=%d P:fork chunk=%d/%d\n",
+                        gpuId, c, splits);
+                fflush(stderr);
+            }
+            if (!FastllmBeginTpAllReduceSideStream(
+                    resView.cudaData, resView.cudaData,
+                    chunkCount, resView.dataType, gpuId)) {
+                return false;
+            }
+            subCount = chunkCount;
+        }
+        (void)subCount;
+        if (Qwen3CudaTpArDebugEnabled()) {
+            fprintf(stderr, "[R1dbg-p] dev=%d P:join\n", gpuId);
+            fflush(stderr);
+        }
+        FastllmEndTpAllReduceSideStream(gpuId);
+        Qwen3CudaTpArPipelineReportRegistered();
+        long uses = Qwen3CudaTpArPipelineUses().fetch_add(
+            1, std::memory_order_relaxed);
+        if (uses < 3) {
+            fprintf(stderr, "[Fastllm] TP AR chunked pipeline: engaged with %d splits"
+                            " (%d rows/chunk)\n", splits, chunk);
+            fflush(stderr);
+        }
+        return true;
+    }
+
     inline void Qwen3CudaLinearResidualReduce(
             Qwen3CudaDirectRunner &runner,
             Data &input, Data &weight, Data &bias,
@@ -984,6 +1374,16 @@ namespace fastllm {
         }
 
         if (tensorParallel) {
+            // R1: chunked projection + side-stream collective. This is the
+            // DeepSeek-V4 execute_in_parallel shape applied to the row-parallel
+            // reduce: chunk c's all-reduce overlaps chunk c+1's GEMM. It must
+            // run before the un-split tail below, which it replaces entirely.
+            if (canAddDirectly && !forceNativeNccl &&
+                Qwen3CudaTryTpChunkedLinearResidualReducePipeline(
+                    runner, input, weight, bias, middle, hiddenStates,
+                    firstTensorParallelRank, gpuId)) {
+                return;
+            }
             if (firstTensorParallelRank) {
                 if (canAddDirectly) {
                     Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias,

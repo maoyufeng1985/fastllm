@@ -43,8 +43,13 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 // Disable the published policy, drain the old device group and release all
 // group-owned signal, scratch and pointer-registration allocations.
 void FastllmCudaCustomAllReduceReset();
+// `stream` is the stream the reduction must be ordered on. nullptr, the default,
+// means the caller's per-thread default stream; pass a stream to overlap the
+// collective with other work on the caller's own stream. A non-default stream is
+// refused while a CUDA graph capture is open.
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
-                                int dataType, int deviceId);
+                                int dataType, int deviceId,
+                                void* stream = nullptr);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of
@@ -68,6 +73,25 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// R1: run the row-parallel all-reduce on an explicit side stream so it can
+// overlap the next operator's GEMM. Skips the host post-sync; the caller is
+// responsible for ordering its own stream (see FastllmTryNcclAllReduceOnSideStream).
+void FastllmNcclAllReduceOnStream(void* data, void* dest, int count, int dataType,
+                                  int deviceId, void *stream);
+// R1: convenience wrapper -- enqueues the collective on a per-(device,thread)
+// side stream, records its completion, and makes the calling stream wait for it
+// without blocking the host. Returns false when the fast path is unavailable
+// (env gate off, stream capture active, or stream creation failed), in which
+// case the caller must issue the ordinary collective itself.
+bool FastllmTryNcclAllReduceOnSideStream(void *data, void *dest, int count,
+                                        int dataType, int deviceId);
+// R1, split form (mirrors vLLM/DeepSeek-V4 execute_in_parallel): Begin forks the
+// collective onto the side stream without joining, so the caller can then issue
+// independent work that overlaps the transfer; End joins the caller's stream
+// with a pure device-side event wait (host never blocks).
+bool FastllmBeginTpAllReduceSideStream(void *data, void *dest, int count,
+                                       int dataType, int deviceId);
+void FastllmEndTpAllReduceSideStream(int deviceId);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
