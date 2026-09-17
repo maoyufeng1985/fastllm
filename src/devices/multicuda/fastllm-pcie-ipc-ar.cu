@@ -35,6 +35,14 @@ bool EnabledByEnv() {
     return on;
 }
 
+bool PreferBeforeCustomEnvy() {
+    static const bool on = []() {
+        const char *v = std::getenv("FASTLLM_PCIE_IPC_AR_BEFORE_CUSTOM");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
 size_t MaxBytesByEnv() {
     static const size_t n = []() {
         const char *v = std::getenv("FASTLLM_PCIE_IPC_AR_MAX_BYTES");
@@ -281,6 +289,10 @@ bool EnsureLocal(Shared &s, int rank) {
 
 bool Enabled() {
     return EnabledByEnv();
+}
+
+bool PreferBeforeCustom() {
+    return PreferBeforeCustomEnvy();
 }
 
 size_t MaxBytes() {

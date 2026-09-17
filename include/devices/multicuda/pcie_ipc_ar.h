@@ -48,7 +48,15 @@ void Shutdown();
 // Number of calls served, for the run report.
 long Uses();
 
+// When set, the PCIe kernel is offered BEFORE the engine's built-in custom
+// all-reduce instead of after it. Needed to measure the two head to head on the
+// small (decode-sized) messages the built-in one normally serves: by default the
+// built-in path is tried first and returns true, so the PCIe kernel never sees
+// them. Off by default; opt in per measurement.
+bool PreferBeforeCustom();
+
 }  // namespace pcieipc
 }  // namespace fastllm
+
 
 #endif  // FASTLLM_PCIE_IPC_AR_H

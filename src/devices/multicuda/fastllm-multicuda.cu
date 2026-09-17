@@ -2198,6 +2198,21 @@ uint64_t FastllmGetNcclGeneration() {
     return g_ncclGeneration.load(std::memory_order_acquire);
 }
 
+// Which implementation actually served each collective. Needed because "the switch
+// is on" does not prove "my code ran": the built-in custom path is tried first and
+// can silently keep all the small messages, leaving the opt-in path unused.
+static std::atomic<long> g_customArServed{0};
+static void CustomArServedNote() {
+    g_customArServed.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void CustomArServedReportAtExit() {
+    std::fprintf(stderr,
+                 "[Fastllm] all-reduce served by: custom=%ld, pcie_ipc=%ld\n",
+                 g_customArServed.load(),
+                 (long)fastllm::pcieipc::Uses());
+}
+
 bool FastllmInitNccl(const std::vector<int>& devices) {
     std::lock_guard<std::mutex> initGuard(g_ncclInitMutex);
     std::vector<int> uniqueDevices = FastllmUniqueNcclDevices(devices);
@@ -2220,6 +2235,13 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     if (ready) {
         FastllmCudaCustomAllReduceInit(uniqueDevices);
         fastllm::pcieipc::Init(uniqueDevices);
+        {
+            static const bool once = []() {
+                std::atexit(CustomArServedReportAtExit);
+                return true;
+            }();
+            (void)once;
+        }
         return true;
     }
 
@@ -3472,10 +3494,28 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     // over CustomArMaxBytes(), so switching this on only pays if a measurement
     // says so.
     const bool defaultStream = (stream == cudaStreamPerThread);
+    // Measurement opt-in (FASTLLM_PCIE_IPC_AR_BEFORE_CUSTOM=1): offer the PCIe kernel
+    // before the built-in custom all-reduce. By default the built-in path is tried
+    // first and, on this box, it accepts everything below 40 KiB -- which is exactly
+    // the decode-sized range -- so the PCIe kernel never sees those messages and the
+    // two can never be compared head to head. Off by default; the ordering below is
+    // unchanged unless the env var is set.
+    if (defaultStream && allowCustomAllReduce &&
+        fastllm::pcieipc::PreferBeforeCustom() &&
+        fastllm::pcieipc::TryAllReduce(data, dest, count, dataType, deviceId)) {
+        if (!skipHostPostSync && FastllmNcclPostSyncEnabled(stream)) {
+            cudaError_t syncState = cudaStreamSynchronize(stream);
+            checkCudaErrors(
+                "Error: CUDA error when synchronizing pcie_ipc allreduce!", syncState);
+        }
+        recordAr(true);
+        return;
+    }
     if (allowCustomAllReduce &&
         (defaultStream || TpArSideStreamCustomArRequested()) &&
         FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId,
                                    defaultStream ? nullptr : (void *)stream)) {
+        CustomArServedNote();
         return;
     }
 
