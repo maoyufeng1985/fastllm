@@ -1,5 +1,6 @@
 import argparse
 import ctypes
+import os
 import hashlib
 import statistics
 import time
@@ -95,6 +96,9 @@ def add_benchmark_args(parser: argparse.ArgumentParser):
                         help="Max output token length for each benchmark request")
     parser.add_argument("--batch", type=int, default=1,
                         help="Number of concurrent benchmark requests")
+    parser.add_argument("--stagger_s", type=float, default=0.0,
+                        help="Delay each request's launch by this many seconds "
+                             "relative to the previous one (0 = launch all back to back)")
     parser.add_argument("--warmup", type=int, default=1,
                         help="Number of warmup requests before benchmark")
     parser.add_argument("--prompt_unit", type=str,
@@ -200,12 +204,18 @@ def _launch_raw_response(model, input_tokens: List[int], output_tokens: int,
 
 def _run_batch(model, input_tokens: List[int], output_tokens: int,
                batch: int, generation_args: Dict[str, object],
-               label: str = "benchmark") -> Dict[str, object]:
+               label: str = "benchmark",
+               stagger_s: float = 0.0) -> Dict[str, object]:
     from .llm import fastllm_lib
 
     requests = []
     batch_start = time.perf_counter()
     for request_id in range(batch):
+        # Stagger mode: request N is launched stagger_s after request N-1. The
+        # wait happens BEFORE this request's own start_time is taken, so the
+        # reported TTFT for each request is still measured from its own launch.
+        if request_id > 0 and stagger_s > 0:
+            time.sleep(stagger_s)
         start_time = time.perf_counter()
         handle = _launch_raw_response(model, input_tokens, output_tokens, generation_args)
         requests.append({
@@ -468,7 +478,8 @@ def fastllm_benchmark(args):
             print()
 
         result = _run_batch(model, input_tokens, args.output_tokens, args.batch,
-                            generation_args)
+                            generation_args,
+                            stagger_s=float(getattr(args, "stagger_s", 0.0) or 0.0))
         _print_result(result)
         return result
     finally:
