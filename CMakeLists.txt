@@ -477,6 +477,7 @@ if (USE_CUDA)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
         src/devices/multicuda/multicudadevice.cpp
         src/devices/multicuda/fastllm-multicuda.cu
+        src/devices/multicuda/fastllm-pcie-ipc-ar.cu
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
