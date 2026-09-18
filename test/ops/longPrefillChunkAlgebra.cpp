@@ -23,6 +23,22 @@ ResponseContext MakePrompt(int n, int preTokens = 0, int remaining = 0) {
     return ctx;
 }
 
+// allTokens is the one field the real engine keeps at the prompt's full length
+// for the whole prefill, so the alignment rule has to be exercised through it.
+// fed is how much of the prompt has already been fed (prefillRemaining is what
+// is left), which is all SelectPrefillChunkLen may look at to find the page
+// boundary the last chunk should stop on.
+ResponseContext MakeChunkedPrefill(int total, int fed) {
+    ResponseContext ctx;
+    const int remaining = total - fed;
+    ctx.allTokens.assign(total, 1);
+    ctx.currentTokens.assign(remaining, 1);
+    ctx.preTokens = fed;
+    ctx.prefillRemaining = remaining;
+    ctx.cacheLen = 0;
+    return ctx;
+}
+
 } // namespace
 
 int main() {
@@ -97,6 +113,47 @@ int main() {
             Check(!CommitIntermediatePrefillChunk(&ctx, 2048),
                   "last chunk falls through to assign");
             Check(ctx.prefillRemaining == 0, "last chunk clears remaining");
+        }
+
+        // 末块停在提示词的最后一个页边界 A = floor(total/pageLen)*pageLen。
+        // 这样 A 之后那点尾巴（<= pageLen-1）留给下一轮，A 本身能成为快照点。
+        // pageLen 在 CPU 单测里是默认值 128（fastllm.cpp 的 defaultPageLen）。
+        {
+            const int pageLen = 128;
+            // 冷启动 15866：喂到 14336 后，末块应从 1530 缩到 15744-14336=1408。
+            auto cold = MakeChunkedPrefill(15866, 14336);
+            Check(SelectPrefillChunkLen(&cold, true, 2048, 0, 0, 8192) ==
+                      15866 / pageLen * pageLen - 14336,
+                  "last chunk stops at the prompt's last page boundary");
+
+            // 缩完是 1408，剩下 122 的尾巴（<= pageLen-1），下一轮继续吃。
+            Check(SelectPrefillChunkLen(&cold, true, 2048, 0, 0, 8192) == 1408,
+                  "aligned last chunk is 1408 for a 15866 prompt fed to 14336");
+
+            // 尾巴那一轮：fed=15744，remaining=122，已经没有页边界可停，不能再缩。
+            auto tail = MakeChunkedPrefill(15866, 15744);
+            Check(SelectPrefillChunkLen(&tail, true, 2048, 0, 0, 8192) == 122,
+                  "the leftover tail is fed whole, not shrunk to nothing");
+
+            // 提示词总长正好是页的整数倍：没有尾巴，末块长度不变。
+            auto exact = MakeChunkedPrefill(15872, 14336);
+            Check(SelectPrefillChunkLen(&exact, true, 2048, 0, 0, 8192) == 1536,
+                  "a prompt already on the page grid is left alone");
+
+            // 尾巴只剩 1 个 token 时不许缩：total=15873 -> A=15872, fed=15744,
+            // alignedLen=128, tailLen=129-128=1。留 1 个 token 的末块会被当成解码步。
+            auto oneTail = MakeChunkedPrefill(15873, 15744);
+            Check(SelectPrefillChunkLen(&oneTail, true, 2048, 0, 0, 8192) == 129,
+                  "a 1-token tail is not created by shrinking");
+
+            // 未分块的一次性 prefill：prefillRemaining == 0，绝不能缩，否则尾巴被静默丢弃。
+            // 短提示词（<= chunkSize）走的就是这条路径。
+            auto shortPrompt = MakePrompt(266);
+            Check(SelectPrefillChunkLen(&shortPrompt, true, 2048, 0, 0, 8192) == 266,
+                  "an un-chunked short prompt is never truncated");
+            auto shortOdd = MakePrompt(176);
+            Check(SelectPrefillChunkLen(&shortOdd, true, 2048, 0, 0, 8192) == 176,
+                  "an un-chunked 176-token prompt is fed whole");
         }
 
         {
