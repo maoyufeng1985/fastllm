@@ -254,6 +254,26 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             time.sleep(0.0005)
 
     batch_end = max(item["end_time"] for item in requests)
+    # 定位用：把每条请求的绝对时刻（相对本次批量开始）打出来。判断"错开有没有
+    # 真的发生""是不是所有请求同时在跑"，看这张表就够，不用再推。
+    # 默认关闭；FASTLLM_BENCH_TIME_TRACE=1 打开。
+    if os.environ.get("FASTLLM_BENCH_TIME_TRACE", "0") not in ("", "0"):
+        for it in requests:
+            ftt = it["first_token_time"]
+            print("[reqtime] id=%d launch=%.3fs ttft=%s first_token@%.3fs end=%.3fs "
+                  "tokens=%d decode_span=%.3fs" % (
+                it["request_id"],
+                it["start_time"] - batch_start,
+                ("%.3fs" % (ftt - it["start_time"])) if ftt else "None",
+                (ftt - batch_start) if ftt else -1.0,
+                it["end_time"] - batch_start,
+                it["output_tokens"],
+                (it["end_time"] - ftt) if ftt else -1.0), flush=True)
+            if it["token_times"]:
+                base = it["token_times"][0]
+                gaps = " ".join("%.0f" % ((t - base) * 1000.0) for t in it["token_times"])
+                print("[toktime] id=%d 首个token@%.3fs 各token相对首字的毫秒: %s" % (
+                    it["request_id"], base - batch_start, gaps), flush=True)
     total_output_tokens = sum(item["output_tokens"] for item in requests)
     ttfts = [
         item["first_token_time"] - item["start_time"]
@@ -282,6 +302,13 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         requests, batch_end)
     last_ttft = max(first_token_times) if first_token_times else None
     decode_before_last = _decode_tokens_before_last_ttft(requests, last_ttft)
+    if os.environ.get("FASTLLM_BENCH_TIME_TRACE", "0") not in ("", "0"):
+        print("[batchtime] batch_end=%.3fs 最早首字@%.3fs 最晚首字@%.3fs 首字散布=%.3fs" % (
+            batch_end - batch_start,
+            (min(first_token_times) - batch_start) if first_token_times else -1.0,
+            (max(first_token_times) - batch_start) if first_token_times else -1.0,
+            (max(first_token_times) - min(first_token_times)) if first_token_times else -1.0),
+            flush=True)
     for item, before in zip(requests, decode_before_last):
         item["common_decode_tokens_per_second"] = _per_request_common_rate(
             item, common_start)

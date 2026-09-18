@@ -31,8 +31,12 @@ CHUNK="${CHUNK:-8192}"
 OUT_TOKENS="${OUT_TOKENS:-8}"
 TIMEOUT="${TIMEOUT:-900}"
 
-# 上下文池：每条请求留 200K 的余量，这样池子不会成为并发上限
-POOL=$((CONC * 200000))
+# 上下文池大小（--tokens）：它是 paged cache 的**上限**，分配量与之成正比。
+# 早先写成 CONC*200000（每条留 200K），4 并发时算出 800000 token，
+# 对应 6250 页 / 204.8 MB 的一次分配，在装完权重的卡上直接 cudaErrorMemoryAllocation
+# （fastllm-cuda.cu:4726）。池子只需覆盖"并发数 × prompt 长度"再加余量。
+# 默认 3 倍余量；要复现历史行为就显式传 POOL_TOKENS。
+POOL="${POOL_TOKENS:-$((CONC * INPUT_TOKENS * 3))}"
 TAG="bc_${INPUT_TOKENS}_c${CONC}_s${STAGGER}_r${ROTATE}"
 LOG="/tmp/${TAG}.out"
 SUM="/tmp/${TAG}_summary.txt"
@@ -60,6 +64,12 @@ echo "G2 Xid 基线=$XID_BEFORE" >> "$SUM"
 # --- 组装环境 ---
 ENVS=(FASTLLM_QWEN35_SM70_CUDA_GRAPH=0 "PYTHONPATH=build-sm70-tests/tools")
 [ "$ROTATE" = "1" ] && ENVS+=(FASTLLM_PREFILL_ROTATE=1)
+# TRACE=1：打开诊断输出——每条请求的绝对时刻与 TTFT、每个 token 的相对毫秒、
+# 批量级时间线（最早/最晚首字与散布）、以及引擎侧的每轮 prefill 预算与被跳过的请求。
+# 判断"几条真的同时在跑""错开有没有生效""限制点在哪"全靠这几组行。
+if [ "${TRACE:-0}" != "0" ]; then
+  ENVS+=(FASTLLM_BENCH_TIME_TRACE=1 FASTLLM_PREFILL_BUDGET_TRACE=1)
+fi
 
 # --- 跑（G3：看门狗包住）---
 tools/gpu_watchdog.sh "$LOG" --timeout "$TIMEOUT" --label "$TAG" -- \
@@ -72,7 +82,27 @@ tools/gpu_watchdog.sh "$LOG" --timeout "$TIMEOUT" --label "$TAG" -- \
 echo "watchdog rc=$?" >> "$SUM"
 
 echo "--- 结果 ---" >> "$SUM"
-grep -aE "Total time|TTFT|TPOP avg|Batch decode|common window|before last TTFT|Token stream sha256|Batch total|Pages limit|Batch limit" "$LOG" 2>/dev/null | head -16 >> "$SUM"
+grep -aE "Total time|Prefill|TTFT|TPOP|Batch decode|common window|before last TTFT|Token stream sha256|Batch total|Per request|Pages limit|Batch limit|Input tokens|Batch " "$LOG" 2>/dev/null | head -20 >> "$SUM"
+
+# TRACE=1 时把诊断行也收进摘要（被判据用到的都在这里）
+if [ "${TRACE:-0}" != "0" ]; then
+  echo "--- 批量时间线 ---" >> "$SUM"
+  grep -a "\[batchtime\]" "$LOG" 2>/dev/null >> "$SUM"
+  echo "--- 每条请求的时刻 ---" >> "$SUM"
+  grep -a "\[reqtime\]" "$LOG" 2>/dev/null >> "$SUM"
+  echo "--- 每个 token 的相对毫秒 ---" >> "$SUM"
+  grep -a "\[toktime\]" "$LOG" 2>/dev/null >> "$SUM"
+  echo "--- 引擎每轮预算（前 30 行）---" >> "$SUM"
+  grep -a "\[budget\]" "$LOG" 2>/dev/null | head -30 >> "$SUM"
+  echo "--- 请求进入调度字典的时刻（引擎侧收到请求）---" >> "$SUM"
+  grep -a "\[handle\]" "$LOG" 2>/dev/null | head -10 >> "$SUM"
+  echo "--- 被过滤出调度列表的请求及原因（isEnding=1 表示已跑完）---" >> "$SUM"
+  grep -a "\[filter\]" "$LOG" 2>/dev/null | head -20 >> "$SUM"
+  echo "--- 预算函数返回值 ---" >> "$SUM"
+  grep -a "\[budgetfn\]" "$LOG" 2>/dev/null | head -3 >> "$SUM"
+  echo "--- 因预算被跳过的请求（若有）---" >> "$SUM"
+  grep -a "\[budgetskip\]" "$LOG" 2>/dev/null | head -20 >> "$SUM"
+fi
 
 # --- G2 收尾比对 ---
 XID_AFTER=$(timeout 15 dmesg 2>/dev/null | grep -cE "NVRM: Xid")
