@@ -11,11 +11,10 @@
   C3 第二轮 cached_tokens > 0，且诊断出现「命中」
 
 需要服务端带 FASTLLM_PREFIX_CACHE_TRACE=1 运行才能看到诊断行。
-"""
-判据（跑前定死）：
-  C1 两轮都拿到 200 响应
-  C2 第一轮诊断里出现 record OK，且 cachedLen 是 128 的整数倍
-  C3 第二轮 cached_tokens > 0（复用真的发生），且明显大于 0
+
+注意：C2 的前提是"第一轮全冷"。如果服务里已经留着同一提示词的快照（比如刚跑过一遍
+这个脚本），第一轮就直接命中、不会记新快照，C2 会假报"否"（C3 仍然是有效的）。
+要复现全冷的一轮，先 `systemctl restart ftllm-server.service` 清掉快照池。
 """
 import json, os, subprocess, sys, time, urllib.request
 from transformers import AutoTokenizer
