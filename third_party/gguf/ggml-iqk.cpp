@@ -1975,7 +1975,16 @@ static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& inf
     if ((X) == 8) return FUNC <8>; \
     return nullptr;
 
+namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
+}
+
 mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
+    // 本文件的实现按 AVX2（部分还有 F16C/FMA）编译。没有 AVX2 的机器上必须返回空，
+    // 让调用方落回 ggml-quant.cpp 那条按宏分档的路径，否则会执行非法指令。
+    if (!fastllm::cpuInstructInfo.hasAVX2) {
+        return nullptr;
+    }
     if (type == GGML_TYPE_Q8_0) {
         RETURN_MATMUL_FUNCTION(mul_mat_q8_0_q8_0_fast, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XXS_R4) {

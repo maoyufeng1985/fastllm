@@ -2624,7 +2624,17 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
 #endif
 }
 
+namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
+}
+
 void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type, ggml_type oriType) {
+    // 本文件和 ggml-iqk.cpp 都按 AVX2 编译。gguf 权重的每一次前向都要先把激活量化成
+    // q8_K，所以这里是整条 gguf 推理路径的必经之处：没有 AVX2 就在此停住报错，
+    // 否则往下会执行非法指令。
+    fastllm::AssertInFastLLM(fastllm::cpuInstructInfo.hasAVX2,
+        "GGUF weights need AVX2 for activation quantization, which this CPU does not have. "
+        "This build does not support GGUF models; use fp16 / bf16 / nvfp4 weights.");
     if (type == GGML_TYPE_Q8_0) {
         quantize_row_q8_0(x, vy, k);
     } else if (type == GGML_TYPE_Q8_1) {

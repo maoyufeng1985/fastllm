@@ -24,6 +24,10 @@ option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
 
+# 定制版用：指定 x86 目标平台，例如 -DFASTLLM_CPU_ARCH=ivybridge。
+# 留空则沿用 -march=native，也就是跟着编译机自己的 CPU 走。
+set(FASTLLM_CPU_ARCH "" CACHE STRING "x86 target CPU for -march=, empty means -march=native")
+
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
@@ -166,6 +170,9 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 else()
     if (MAKE_WHL_X86)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -mavx -mavx2 -mf16c -mfma -static-libstdc++ -static-libgcc -fPIC -Wl,-Bsymbolic -Wl,--exclude-libs,ALL")
+    elseif (FASTLLM_CPU_ARCH)
+        message(STATUS "FASTLLM_CPU_ARCH: ${FASTLLM_CPU_ARCH} (-march=native is not used)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=${FASTLLM_CPU_ARCH}")
     else()
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
     endif()
@@ -197,6 +204,17 @@ else()
             PROPERTIES
             COMPILE_OPTIONS "${AMX_COMPILE_OPTIONS}"
         )
+        if (FASTLLM_CPU_ARCH)
+            # ggml 这两个文件只有 AVX2 一条实现路径，跟不了低于 AVX2 的基准。
+            # 定制版不加载 gguf 格式的模型，所以单独按 AVX2 编，让构建能过；
+            # 运行时由 ggml-iqk.cpp 的 GetMulMatFunction 按 hasAVX2 挡住。
+            set_source_files_properties(
+                "third_party/gguf/ggml-quant.cpp"
+                "third_party/gguf/ggml-iqk.cpp"
+                PROPERTIES
+                COMPILE_OPTIONS "-mavx2;-mf16c;-mfma"
+            )
+        endif()
     endif()
 endif()
 

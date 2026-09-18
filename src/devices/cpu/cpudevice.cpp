@@ -875,7 +875,8 @@ namespace fastllm {
         }
 #endif
     
-#ifdef __AVX__
+#if defined(__AVX2__)
+        // 这段用的是 256 位整数指令，属于 AVX2；只判 __AVX__ 会让 AVX1 平台编译失败
         for (; i + 7 < len; i += 8) {
             __m256i float_vec = _mm256_loadu_si256((__m256i*)&float32[i]);
             __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(float_vec, 16),
@@ -2531,6 +2532,12 @@ namespace fastllm {
                 );
             }
         } else if (dstDataType >= DataType::DATA_GGUF_FORMAT && dstDataType < DataType::DATA_GGUF_FORMAT_END) {
+            // iqk_quantize_row_q8_K 来自 ggml-quant.cpp，那个文件整体按 AVX2 编译。
+            // 这个断言针对的是"把权重转成 gguf 量化格式"这个方向；推理方向的必经点
+            // 在那个函数自己的入口上，两边都挡。
+            AssertInFastLLM(cpuInstructInfo.hasAVX2,
+                "ConvertFromFloat32 to a GGUF quant type needs AVX2, which this CPU does not have. "
+                "Use a non-GGUF model (fp16 / bf16 / nvfp4) with this build.");
             auto ggmlType = (ggml_type)((int)dstDataType - (int)DataType::DATA_GGUF_FORMAT);
             size_t rowCount = ggml_row_size(ggmlType, columns);
             for (int i = 0; i < rows; i++) {
