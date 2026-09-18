@@ -1752,7 +1752,11 @@ enum CustomArCensusSlot {
     kCensusPolicyDeclined = 1,
     kCensusPointerDeclined = 2,
     kCensusLaunched = 3,
-    kCensusSlots = 4,
+    // Kept separate from kCensusLaunched: the TP4 push kernel is a distinct
+    // path, so "the switch is set" and "the new kernel served N collectives"
+    // have to be two different numbers.
+    kCensusPush4Launched = 4,
+    kCensusSlots = 5,
 };
 
 std::atomic<long> g_customArCensusCalls[kCensusSlots];
@@ -1775,8 +1779,9 @@ void CustomArCensusReport() {
         "declined: published policy",
         "declined: pointer registration",
         "launched on the custom kernel",
+        "launched on the TP4 push kernel",
     };
-    std::fprintf(stderr, "[Fastllm] custom AR census (per rank):\n");
+    std::fprintf(stderr, "[Fastllm] custom AR census (whole process, all ranks):\n");
     for (int i = 0; i < kCensusSlots; ++i) {
         std::fprintf(stderr, "    %-32s %8ld call(s), %9.1f MiB replayed\n",
                      names[i], g_customArCensusCalls[i].load(),
@@ -1869,26 +1874,24 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     // packedWidth times too long and read past the buffer.)
     if (!useTwoStage && CustomArUsePush4(state, bytes)) {
         const int packetCount = (int)(bytes / 16);
-        if (dataType == fastllm::DataType::FLOAT16 &&
-            LaunchCustomArPush4<half>(
+        bool pushed = false;
+        if (dataType == fastllm::DataType::FLOAT16) {
+            pushed = LaunchCustomArPush4<half>(
                 state, reinterpret_cast<const half *>(data),
-                reinterpret_cast<half *>(dest), rank, packetCount, stream)) {
-            CustomArCensusNote(kCensusLaunched, bytes, census);
-            return true;
-        }
-        if (dataType == fastllm::DataType::BFLOAT16 &&
-            LaunchCustomArPush4<__nv_bfloat16>(
+                reinterpret_cast<half *>(dest), rank, packetCount, stream);
+        } else if (dataType == fastllm::DataType::BFLOAT16) {
+            pushed = LaunchCustomArPush4<__nv_bfloat16>(
                 state, reinterpret_cast<const __nv_bfloat16 *>(data),
                 reinterpret_cast<__nv_bfloat16 *>(dest), rank, packetCount,
-                stream)) {
-            CustomArCensusNote(kCensusLaunched, bytes, census);
-            return true;
-        }
-        if (dataType == fastllm::DataType::FLOAT32 &&
-            LaunchCustomArPush4<float>(
+                stream);
+        } else if (dataType == fastllm::DataType::FLOAT32) {
+            pushed = LaunchCustomArPush4<float>(
                 state, reinterpret_cast<const float *>(data),
-                reinterpret_cast<float *>(dest), rank, packetCount, stream)) {
+                reinterpret_cast<float *>(dest), rank, packetCount, stream);
+        }
+        if (pushed) {
             CustomArCensusNote(kCensusLaunched, bytes, census);
+            CustomArCensusNote(kCensusPush4Launched, bytes, census);
             return true;
         }
     }
