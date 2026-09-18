@@ -274,6 +274,13 @@ def apply_default_generation_config_overrides(model, args):
         logging.info("Override default generation config from cli: %s", overrides)
 
 def _fastllm_server(args, startup_progress):
+    # Resolve the API key BEFORE the check below decides whether to install the auth
+    # middleware. Passing the key via FASTLLM_API_KEY instead of --api_key keeps it out
+    # of argv (`ps` is world-readable), but the fallback must run first: with it placed
+    # after this check, moving the key to the environment silently disabled auth
+    # entirely - the server answered 200 to unauthenticated requests.
+    if not args.api_key:
+        args.api_key = os.environ.get("FASTLLM_API_KEY", "")
     if args.api_key:
         @app.middleware("http")
         async def authentication(request: Request, call_next):
@@ -305,7 +312,11 @@ def _fastllm_server(args, startup_progress):
     
     apply_page_size_default(args)
     init_logging()
-    logging.info(args)
+    # args is logged in full; mask the key so the journal never contains it.
+    _logged_args = vars(args).copy()
+    if _logged_args.get("api_key"):
+        _logged_args["api_key"] = "***"
+    logging.info(_logged_args)
     # Materialize API serving high-water scratch before automatic KV sizing.
     # Real CUDA allocations are frozen only when FASTLLM_CUDA_MEM_CHECK is
     # explicitly enabled; ordinary serving must not pay the fixed frozen-pool
