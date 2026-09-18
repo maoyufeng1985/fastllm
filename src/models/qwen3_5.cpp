@@ -1427,7 +1427,7 @@ namespace fastllm {
         if (!Qwen35PrefixTraceOn()) {
             return;
         }
-        static std::atomic<int> budget{200};
+        static std::atomic<int> budget{4000};
         if (budget.fetch_sub(1) <= 0) {
             return;
         }
@@ -22046,6 +22046,10 @@ namespace fastllm {
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
             if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+                Qwen35PrefixTrace("restore SKIP 入口: ctx=%d cacheLen=%d tokens=%zu",
+                                  (int)(ctx != nullptr),
+                                  ctx == nullptr ? -1 : ctx->cacheLen,
+                                  ctx == nullptr ? (size_t)0 : ctx->currentTokens.size());
                 return 0;
             }
             auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
@@ -22057,6 +22061,7 @@ namespace fastllm {
                 }
             }
             if (probeManager == nullptr) {
+                Qwen35PrefixTrace("restore SKIP 探针管理器为空: kvCacheId=%d", model->kvCacheId);
                 return 0;
             }
 
@@ -22073,6 +22078,8 @@ namespace fastllm {
 
             int minCachedPages = (int)queryManager(probeManager).size();
             if (minCachedPages <= 0) {
+                Qwen35PrefixTrace("restore SKIP 探针层无命中页: pages=%d tokens=%zu",
+                                  minCachedPages, ctx->currentTokens.size());
                 return 0;
             }
             for (int layer = 0; layer < model->block_cnt; layer++) {
@@ -22084,12 +22091,17 @@ namespace fastllm {
                             manager->pageLen != probeManager->pageLen) {
                             continue;
                         }
-                        minCachedPages = std::min(
-                            minCachedPages, (int)queryManager(manager).size());
+                        int layerPages = (int)queryManager(manager).size();
+                        if (layerPages < minCachedPages) {
+                            minCachedPages = layerPages;
+                            Qwen35PrefixTrace("restore 层命中下降: layer=%d isKey=%d pages=%d",
+                                              layer, (int)(keyFlag == 0), layerPages);
+                        }
                     }
                 }
             }
             if (minCachedPages <= 0) {
+                Qwen35PrefixTrace("restore SKIP 层间取最小后为 0");
                 return 0;
             }
 
@@ -22097,8 +22109,11 @@ namespace fastllm {
             if (cachedLen >= (int)ctx->currentTokens.size()) {
                 minCachedPages--;
                 cachedLen = minCachedPages * probeManager->pageLen;
+                Qwen35PrefixTrace("restore 整段覆盖砍一页: cachedLen=%d tokens=%zu",
+                                  cachedLen, ctx->currentTokens.size());
             }
             if (minCachedPages <= 0) {
+                Qwen35PrefixTrace("restore SKIP 砍页后为 0");
                 return 0;
             }
 
@@ -22106,6 +22121,8 @@ namespace fastllm {
             extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
             minCachedPages = extraCachedLen / probeManager->pageLen;
             if (minCachedPages <= 0) {
+                Qwen35PrefixTrace("restore SKIP 线性层快照未命中: maxLen=%d extra=%d",
+                                  cachedLen, extraCachedLen);
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;
@@ -23927,8 +23944,15 @@ namespace fastllm {
                         if (contextIt == model->responseContextDict.dicts.end()) {
                             continue;
                         }
+                        // 线性注意力状态是递推量，只能记在当前长度上，所以快照必须落在页边界。
+                        // 提示词总长几乎不会是 128 的整数倍：拦掉所有中途块，最后一块又对不齐，
+                        // 于是整条前缀缓存对真实流量一次都不生效。这里放行那些正好补齐整页的中间块。
+                        const int fedTokens =
+                            (int)contextIt->second->allTokens.size() -
+                            contextIt->second->prefillRemaining;
                         if (longPrefillChunk &&
-                            contextIt->second->prefillRemaining > seqLens[i]) {
+                            contextIt->second->prefillRemaining > seqLens[i] &&
+                            fedTokens % pageLen != 0) {
                             continue;
                         }
                         if (i < (int)seqLens.size() && seqLens[i] > 1 &&

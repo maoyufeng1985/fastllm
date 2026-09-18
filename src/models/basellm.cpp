@@ -2883,7 +2883,15 @@ namespace fastllm {
                 for (int i = 0; i < (int)handles.size(); i++) {
                     if (seqLens[i] > 1) {
                         auto &ctx = *model->responseContextDict.dicts[handles[i]];
-                        if (longPrefillChunk && ctx.prefillRemaining > seqLens[i]) {
+                        // 线性注意力快照只能记在当前长度上，所以必须落在页边界。拦掉全部中途块后，
+                        // 只剩最后一块能记录，而它的长度等于提示词总长，几乎不会是 128 的倍数，
+                        // 于是真实流量一个快照都记不下来。放行正好补齐整页的中途块。
+                        // 对齐要判"已喂进去的进度"，不是 allTokens.size()：后者一开始
+                        // 就等于提示词总长，永远不是 128 的倍数，会把每个中途块都拦掉。
+                        const int fedTokens =
+                            (int)ctx.allTokens.size() - ctx.prefillRemaining;
+                        if (longPrefillChunk && ctx.prefillRemaining > seqLens[i] &&
+                            fedTokens % pageLen != 0) {
                             continue;
                         }
                         if ((int)ctx.allTokens.size() >= pageLen) {
