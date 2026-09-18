@@ -2,6 +2,7 @@
 // Created by huangyuyang on 2/19/26.
 //
 
+#include <cstdarg>
 #include "utils.h"
 
 #include "qwen3_5.h"
@@ -1409,6 +1410,34 @@ namespace fastllm {
                config.top_p > 0.0f && config.top_p <= 1.0f &&
                std::isfinite(config.repeat_penalty) &&
                config.repeat_penalty > 0.0f;
+    }
+
+    // 前缀缓存诊断。放在 USE_CUDA 外面，因为下面的模型代码在 CPU-only 构建里也要调它。
+    // 诊断：前缀/历史缓存到底走没走通。默认关闭，FASTLLM_PREFIX_CACHE_TRACE=1 打开。
+    // 记录与查询各有若干道门（开关、是否有线性注意力层、长度页对齐、快照间隔），
+    // 不打出来就只能看到 cached_tokens=0，分不清是"没记录"还是"没命中"。
+    static bool Qwen35PrefixTraceOn() {
+        static const bool on = [] {
+            const char *v = std::getenv("FASTLLM_PREFIX_CACHE_TRACE");
+            return v != nullptr && v[0] != 0 && v[0] != '0';
+        }();
+        return on;
+    }
+    static void Qwen35PrefixTrace(const char *fmt, ...) {
+        if (!Qwen35PrefixTraceOn()) {
+            return;
+        }
+        static std::atomic<int> budget{200};
+        if (budget.fetch_sub(1) <= 0) {
+            return;
+        }
+        char body[256];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(body, sizeof body, fmt, ap);
+        va_end(ap);
+        fprintf(stderr, "[prefixcache] %s\n", body);
+        fflush(stderr);
     }
 
 #ifdef USE_CUDA
@@ -4756,6 +4785,7 @@ namespace fastllm {
             const char *enabled = std::getenv("FASTLLM_PREFIX_CACHE");
             return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
         }
+
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
             int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
@@ -9822,12 +9852,18 @@ namespace fastllm {
         if (context == nullptr ||
             !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
+            Qwen35PrefixTrace("record SKIP 入口门: ctx=%d enabled=%d hasLinear=%d",
+                              (int)(context != nullptr),
+                              (int)Qwen35LinearPrefixCacheEnabled(),
+                              (int)Qwen35HasLinearAttentionLayers(this, this->block_cnt));
             return false;
         }
         int pageLen = fastllm::GetPageLen();
         int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
             currentLen % pageLen != 0) {
+            Qwen35PrefixTrace("record SKIP 页对齐门: currentLen=%d allTokens=%zu pageLen=%d",
+                              currentLen, context->allTokens.size(), pageLen);
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
@@ -9975,15 +10011,24 @@ namespace fastllm {
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
         context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;
+        // 注意：snapshot 在这里已经被 move 进 items，不能再解引用（否则空指针段错误，
+        // 我第一版就是这么把服务打崩的）。只用作用域内还活着的值。
+        Qwen35PrefixTrace("record OK: cachedLen=%d requestId=%d",
+                          currentLen, context->intParams["qwen35_linear_prefix_request_id"]);
         return true;
     }
 
     int Qwen3_5Model::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
         if (context == nullptr || maxCachedLen <= 0 ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
+            Qwen35PrefixTrace("query PASS-THROUGH: ctx=%d maxLen=%d hasLinear=%d -> 返回 %d",
+                              (int)(context != nullptr), maxCachedLen,
+                              (int)Qwen35HasLinearAttentionLayers(this, this->block_cnt),
+                              maxCachedLen);
             return maxCachedLen;
         }
         if (!Qwen35LinearPrefixCacheEnabled()) {
+            Qwen35PrefixTrace("query DISABLED: 开关为 false -> 返回 0（不命中）");
             return 0;
         }
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
@@ -9994,6 +10039,10 @@ namespace fastllm {
                 this, context->currentTokens, maxCachedLen, -1,
                 requireMtp, requireDFlash, dflashLayers,
                 dflashKvHeads, dflashHeadDim);
+        Qwen35PrefixTrace("query 查表: tokens=%zu maxLen=%d -> %s",
+                          context->currentTokens.size(), maxCachedLen,
+                          snapshot == nullptr ? "无快照(返回0=不命中)"
+                                              : "命中");
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
     }
 
@@ -10130,7 +10179,35 @@ namespace fastllm {
         // warmup sizes its scratch by the chunk, so a wider budget would not
         // grow per-forward activation memory either way.
         if (PrefillRotationEnabled()) {
-            return 2 * this->GetChunkedPrefillSize();
+            // 轮转预算 = 允许同时在飞的 slice 数 × 每片 chunk。历史上写死 2，注释
+            // 理由是"一个 forward 里 3 片及以上会在 batched prefill 路径 abort（已实测）"。
+            // FASTLLM_PREFILL_ROTATE_SLICES 就是用来探这条边界的：让三条长请求
+            // 同时在飞。默认 3（每轮放 3 片 chunk），取值限制在 2..8。
+            //
+            // 注意（实测 2026-09-17，16K×3 错开 10s）：把 2 改成 3 后预算函数确实
+            // 返回 24576（原 16384），但"因预算不足被跳过"的次数两次都是 0 —— 说明
+            // 预算从来不是限制点，改成 3 对那个场景没有可观测效果。原注释警告的
+            // "3 片同 forward 会 abort"也没有被触发过（因为压根没凑满 3 片）。
+            static const int slices = [] {
+                const char *env = std::getenv("FASTLLM_PREFILL_ROTATE_SLICES");
+                if (env == nullptr || env[0] == '\0') {
+                    return 3;   // 默认 3：轮转预算 = 3 片 chunk
+                }
+                int v = std::atoi(env);
+                return (v >= 2 && v <= 8) ? v : 3;
+            }();
+            const int ret = slices * this->GetChunkedPrefillSize();
+            // 定位用：这个函数被反复调用，只在 env 打开时打，且限量。
+            if (const char *bt = std::getenv("FASTLLM_PREFILL_BUDGET_TRACE")) {
+                if (bt[0] != '\0' && bt[0] != '0') {
+                    static std::atomic<int> fnLines{0};
+                    if (fnLines.fetch_add(1) < 6) {
+                        fprintf(stderr, "[budgetfn] rotation=1 slices=%d chunkPrefill=%d returning=%d\n",
+                                slices, this->GetChunkedPrefillSize(), ret);
+                    }
+                }
+            }
+            return ret;
         }
         if (this->chunkedPrefillSize >= 0) {
             return this->chunkedPrefillSize;

@@ -6,6 +6,8 @@
 #include "longPrefillChunk.h"
 #include "utils.h"
 #include <sstream>
+#include <cstdarg>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <climits>
@@ -21,6 +23,68 @@
 
 namespace fastllm {
     namespace {
+    // 历史缓存（--cache_history）的运行时日志：每次记录/命中/淘汰/搬去 CPU 打一行，
+    // 行内自带当前总量，方便事后直接看日志，不用再拼统计。
+    static long long HistoryCacheTraceBudget() {
+        const char *v = std::getenv("FASTLLM_CACHE_HISTORY_TRACE_LINES");
+        if (v == nullptr || v[0] == 0) {
+            return 20000;
+        }
+        long long n = std::atoll(v);
+        return n > 0 ? n : 20000;
+    }
+
+    static bool HistoryCacheTraceOn() {
+        static const bool on = [] {
+            const char *v = std::getenv("FASTLLM_CACHE_HISTORY_TRACE");
+            return v != nullptr && v[0] != 0 && v[0] != '0';
+        }();
+        return on;
+    }
+
+    static void HistoryCacheTrace(const char *fmt, ...) {
+        if (!HistoryCacheTraceOn()) {
+            return;
+        }
+        static std::atomic<long long> budget{HistoryCacheTraceBudget()};
+        if (budget.fetch_sub(1) <= 0) {
+            return;
+        }
+        char body[512];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(body, sizeof body, fmt, ap);
+        va_end(ap);
+        fprintf(stderr, "[histcache] %s\n", body);
+        fflush(stderr);
+    }
+
+    // 调用方必须已持 manager.locker
+    static std::string HistoryCacheSummaryLocked(const PastKVCacheManager &m) {
+        int records = (int)m.memorys.size();
+        long long tokens = 0, bytes = 0;
+        int onCPU = 0;
+        for (auto &it : m.memorys) {
+            tokens += it.second->tokens;
+            for (auto &kv : it.second->kv) {
+                bytes += (long long)kv.first.GetBytes() + (long long)kv.second.GetBytes();
+                onCPU |= (kv.first.lockInCPU || kv.second.lockInCPU) ? 1 : 0;
+            }
+        }
+        char buf[192];
+        std::snprintf(buf, sizeof buf, "共 %d/%d 条 %lld token KV=%.1fMB 在CPU=%d",
+                      records, m.maxRecordNum, tokens, bytes / 1048576.0, onCPU);
+        return std::string(buf);
+    }
+
+    static std::string HistoryCacheTokensPrefix(const std::vector <int> &t, size_t n = 8) {
+        std::string r;
+        for (size_t i = 0; i < t.size() && i < n; i++) {
+            r += std::to_string(t[i]) + " ";
+        }
+        return r;
+    }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -439,6 +503,11 @@ namespace fastllm {
     // verbose flag is set on the model only after construction and therefore
     // cannot observe the calibration that decides the KV pool size.
     static void TraceStartupMemory(const char *stage) {
+#ifndef USE_CUDA
+        // 这是显存统计，CPU-only 构建里没有 FastllmCudaGetTotalSizes 可调
+        (void)stage;
+        return;
+#else
         static const bool enabled = [] {
             const char *env = std::getenv("FASTLLM_MEM_TRACE");
             return env != nullptr && env[0] != '0';
@@ -461,6 +530,7 @@ namespace fastllm {
         printf("[MEM] %-36s gpuFree=%lld MB / %lld MB (sum over %zu devices)\n",
                stage, freeMB, totalMB, freeSizes.size());
         fflush(stdout);
+#endif
     }
 
     bool basellm::CanUseGPUForward() const {
@@ -555,6 +625,9 @@ namespace fastllm {
             return;
         }
         this->TryRecordHistoryCache(context->allTokens);
+        HistoryCacheTrace("记录入口 saveHistoryChat=%d 走通用历史缓存=%d allTokens=%zu",
+                          this->saveHistoryChat ? 1 : 0, this->UseGenericHistoryCache() ? 1 : 0,
+                          context->allTokens.size());
         if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
             this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
         }
@@ -768,6 +841,7 @@ namespace fastllm {
         return true;
     }
 
+
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
         this->inputToken = inputToken;
         this->tokens = tokens;
@@ -777,6 +851,7 @@ namespace fastllm {
         for (int i = 0; i < kv->size(); i++) {
             this->kv.push_back(std::make_pair(Data(dataType), Data(dataType)));
         }
+        long long cpuBytes = 0;
         for (int i = 0; i < kv->size(); i++) {
             this->kv[i].first.CopyFrom((*kv)[i].first);
             this->kv[i].second.CopyFrom((*kv)[i].second);
@@ -786,8 +861,12 @@ namespace fastllm {
                 this->kv[i].first.lockInCPU = true;
                 this->kv[i].second.ToDevice(DataDevice::CPU);
                 this->kv[i].second.lockInCPU = true;
+                cpuBytes += (long long)this->kv[i].first.GetBytes() + (long long)this->kv[i].second.GetBytes();
             }
         }
+        HistoryCacheTrace("搬去CPU 层数=%zu tokens=%d 拷入内存=%.1fMB 首token=[%s]",
+                          kv->size(), tokens, cpuBytes / 1048576.0,
+                          HistoryCacheTokensPrefix(inputToken).c_str());
     }
 
     void PastKVCacheManager::SetMaxRecordNum(int maxRecordNum) {
@@ -796,6 +875,9 @@ namespace fastllm {
     }
 
     void PastKVCacheManager::Record(const std::vector <int> &inputToken, int tokens, std::vector<std::pair<Data, Data> > *kv) {
+        HistoryCacheTrace("记录 请求 tokens=%zu 层数=%zu 首token=[%s]",
+                          inputToken.size(), kv->size(),
+                          HistoryCacheTokensPrefix(inputToken).c_str());
         bool isLinear = false;
         for (int i = 0; i < kv->size(); i++) {
             if ((*kv)[i].first.isLinearAttention) {
@@ -807,6 +889,8 @@ namespace fastllm {
         if (this->memorys.find(inputToken) != this->memorys.end()) {
             this->memorys[inputToken]->recordTimes++;
             this->memorys[inputToken]->flushTime = ++flushTime;
+            HistoryCacheTrace("记录 已存在同一条 -> 引用计数=%d（未新增）",
+                              this->memorys[inputToken]->recordTimes);
             return;
         }
 
@@ -828,6 +912,7 @@ namespace fastllm {
             }
         }
         if (replaceCache.size() > 0) {
+            HistoryCacheTrace("记录 覆盖旧条(前缀重合>90%%) tokens=%zu", replaceCache.size());
             delete this->memorys[replaceCache];
             this->memorys.erase(this->memorys.find(replaceCache));
         }
@@ -840,17 +925,22 @@ namespace fastllm {
                     eraseToken = it.first;
                 }
             }
+            HistoryCacheTrace("记录 超出上限 -> 淘汰最久未用 tokens=%zu", eraseToken.size());
             delete this->memorys[eraseToken];
             this->memorys.erase(this->memorys.find(eraseToken));
         }
 
         this->memorys[inputToken] = new PastKVCacheMemory(inputToken, tokens, ++flushTime, kv);
+        HistoryCacheTrace("记录 新增完成 tokens=%d %s", tokens,
+                          HistoryCacheSummaryLocked(*this).c_str());
     }
 
     void PastKVCacheManager::Remove(const std::vector <int> &inputToken) {
         std::lock_guard <std::mutex> lock(this->locker);
         if (this->memorys.find(inputToken) != this->memorys.end()) {
             if ((--this->memorys[inputToken]->recordTimes) <= 0) {
+                HistoryCacheTrace("释放 引用归零 -> 删除该条 %s",
+                                  HistoryCacheSummaryLocked(*this).c_str());
                 delete this->memorys[inputToken];
                 this->memorys.erase(this->memorys.find(inputToken));
             }
@@ -858,6 +948,8 @@ namespace fastllm {
     }
 
     std::pair <PastKVCacheMemory*, int> PastKVCacheManager::Get(const std::vector <int> &inputToken) {
+        HistoryCacheTrace("查询 请求 tokens=%zu 首token=[%s]", inputToken.size(),
+                          HistoryCacheTokensPrefix(inputToken).c_str());
         bool isLinear = false;
         if (this->memorys.size() > 0) {
             auto &kv = this->memorys.begin()->second->kv;
@@ -893,6 +985,15 @@ namespace fastllm {
             ret->flushTime = ++this->flushTime;
         }
         maxPrefixToken = std::min(maxPrefixToken, (int)inputToken.size() - 1);
+        if (ret == nullptr || maxPrefixToken <= 0) {
+            HistoryCacheTrace("查询 -> 未命中（没有任何前缀重合） %s",
+                              HistoryCacheSummaryLocked(*this).c_str());
+        } else {
+            HistoryCacheTrace("查询 -> 命中 可复用=%d/%zu token 该条存了=%d token 整条命中=%d %s",
+                              maxPrefixToken, inputToken.size(), ret->tokens,
+                              (maxPrefixToken == ret->tokens) ? 1 : 0,
+                              HistoryCacheSummaryLocked(*this).c_str());
+        }
         return std::make_pair(ret, maxPrefixToken);
     }
 
@@ -966,11 +1067,15 @@ namespace fastllm {
         if (this->saveHistoryChat) {
             if (lastKeyValues != nullptr) {
                 if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
+                    HistoryCacheTrace("单会话 上次前缀对不上 -> 丢掉旧KV lastPrompt=%zu 本次=%zu",
+                                      lastPrompt.size(), input.size());
                     lastPrompt = "";
                     lastPromptTokens = 0;
                     delete lastKeyValues;
                     lastKeyValues = nullptr;
                 } else {
+                    HistoryCacheTrace("单会话 复用上次KV 可跳过前缀=%zu/本次=%zu token",
+                                      lastPrompt.size(), input.size());
                     input = input.substr(lastPrompt.size());
                 }
             }
@@ -1742,6 +1847,9 @@ namespace fastllm {
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
+            // 诊断计数：这一轮有几条请求分别处在"可进 prefill / 正在解码 / 在飞 prefill"。
+            // hasPrefill 是布尔值，只看它无法判断"有几条本来可以一起进"。
+            int nPromptEligible = 0, nDecodeActive = 0, nInFlight = 0;
             bool hasPrefill = false;
             bool hasInFlightPrefill = false;
             struct DecodeOrder {
@@ -1754,6 +1862,22 @@ namespace fastllm {
             int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
 
             for (auto &it: model->responseContextDict.dicts) {
+                // 诊断：请求在字典里、却没进调度列表时，把原因打出来。
+                if (const char *bt = std::getenv("FASTLLM_PREFILL_BUDGET_TRACE")) {
+                    if (bt[0] != '\0' && bt[0] != '0') {
+                        static std::atomic<int> filtLines{0};
+                        if ((it.second->isAbort || it.second->isEnding) &&
+                            filtLines.fetch_add(1) < 60) {
+                            fprintf(stderr,
+                                    "[filter] handle=%d isAbort=%d isEnding=%d pretok=%d "
+                                    "prefillRemain=%d curTok=%zu\n",
+                                    it.first, (int)it.second->isAbort,
+                                    (int)it.second->isEnding, it.second->preTokens,
+                                    it.second->prefillRemaining,
+                                    it.second->currentTokens.size());
+                        }
+                    }
+                }
                 if (it.second->isAbort) {
                     it.second->TryRecordPagedCache(model);
                     abortHandles.push_back(it.first);
@@ -1772,12 +1896,15 @@ namespace fastllm {
                     auto role = ClassifyRequest(it.second, longPrefillChunk);
                     if (role.isDecodeActive) {
                         currentActivate++;
+                        nDecodeActive++;
                     }
                     if (role.isPromptEligible) {
                         hasPrefill = true;
+                        nPromptEligible++;
                     }
                     if (role.inFlightPrefill) {
                         hasInFlightPrefill = true;
+                        nInFlight++;
                     }
                 }
                 {
@@ -1890,6 +2017,24 @@ namespace fastllm {
             int currentPrefillTokenLimit =
                 isActiveAddPrefill && !hasIdleBurstPrefill ?
                 activePrefillTokenLimit : batchedPrefillTokenLimit;
+            // 定位用：把"这一轮实际生效的 prefill 预算"打出来。只看它就能判断
+            // 第 3 条是被哪一处限制挡住的（batched 预算 / active 预算 / 每轮喂多少）。
+            // 默认关闭；FASTLLM_PREFILL_BUDGET_TRACE=1 打开，最多打 40 行。
+            if (const char *bt = std::getenv("FASTLLM_PREFILL_BUDGET_TRACE")) {
+                if (bt[0] != '\0' && bt[0] != '0') {
+                    static std::atomic<int> budgetLines{0};
+                    if (budgetLines.fetch_add(1) < 400) {
+                        fprintf(stderr,
+                                "[budget] it=%d orders=%zu 可进prefill=%d 解码中=%d "
+                                "在飞prefill=%d chosen=%d batched=%d active=%d "
+                                "pagesLimit=%d busyPages=%d seqLens=%zu\n",
+                                budgetLines.load(), orders.size(), nPromptEligible,
+                                nDecodeActive, nInFlight, currentPrefillTokenLimit,
+                                batchedPrefillTokenLimit, activePrefillTokenLimit,
+                                pagesLimit, busyPages, seqLens.size());
+                    }
+                }
+            }
 
             for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                 if (isPrompt == 1 && forceDecodeThisIteration) {
@@ -2321,6 +2466,19 @@ namespace fastllm {
                         if (longPrefillChunk) {
                             if (prefillTokenCount + thisLen > currentPrefillTokenLimit &&
                                 seqLens.size() > 0) {
+                                // 定位用：某条请求因为"这一轮的 token 预算不够"被跳过。
+                                // 这个计数就是"几条能同时进 prefill"的实际闸门。
+                                if (const char *bt = std::getenv("FASTLLM_PREFILL_BUDGET_TRACE")) {
+                                    if (bt[0] != '\0' && bt[0] != '0') {
+                                        static std::atomic<int> skipLines{0};
+                                        if (skipLines.fetch_add(1) < 200) {
+                                            fprintf(stderr, "[budgetskip] used=%d thisLen=%d limit=%d "
+                                                    "seqLens=%zu -> skipped\n",
+                                                    prefillTokenCount, thisLen,
+                                                    currentPrefillTokenLimit, seqLens.size());
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                         } else if (thisLen > prefillChunkSize) {
@@ -2821,10 +2979,15 @@ namespace fastllm {
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
                                       const std::map <std::string, std::vector <Data*> > &multimodalInput) {
+        // 历史缓存只在旧引擎的内联循环里写；这行把实际选中的引擎报出来，
+        // 用来判断"没写缓存"是配置问题还是代码路径问题。
+        // nullptr = 本次没有创建线程（沿用已有主循环），不打印，避免默认值与"真的选了旧引擎"混淆
+        const char *hcEngineName = nullptr;
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
                 if (this->UseModelSpecificScheduler()) {
+                    hcEngineName = "RunModelSpecificScheduler";
                     mainLoop = new std::thread([](basellm *model) {
                         model->RunModelSpecificScheduler();
                     }, this);
@@ -2840,15 +3003,18 @@ namespace fastllm {
                     }
                     if (useNewEngine) {
                         if (this->CanUseGPUForward()) {
+                            hcEngineName = "GPUMainLoop";
                             mainLoop = new std::thread([](basellm *model) {
                                 model->GPUMainLoop();
                             }, this);
                         } else {
+                            hcEngineName = "NewMainLoop";
                             mainLoop = new std::thread([](basellm *model) {
                                 model->NewMainLoop();
                             }, this);
                         }
                     } else {
+                hcEngineName = "旧引擎(内联循环)";
                 mainLoop = new std::thread([](basellm *model) {
                     long long kvCacheLimit = 16LL << 30;
 #ifdef USE_CUDA
@@ -3296,10 +3462,25 @@ namespace fastllm {
                 }
             }
         }
+        if (hcEngineName != nullptr) {
+            HistoryCacheTrace("引擎选中 %s（历史缓存仅在「旧引擎(内联循环)」里写入）", hcEngineName);
+        }
         mainLoopLocker.unlock();
 
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
+        // 诊断：请求是在哪一刻真正进入调度字典的。与 Python 侧的发射时刻一比对，
+        // 就能判断"晚到的请求是没进字典，还是进了却没被调度"。
+        if (const char *bt = std::getenv("FASTLLM_PREFILL_BUDGET_TRACE")) {
+            if (bt[0] != '\0' && bt[0] != '0') {
+                static const auto t0 = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "[handle] +%lldms handle=%d dictSize=%zu tokens=%zu\n",
+                        (long long)ms, handleId, responseContextDict.dicts.size(),
+                        inputTokens.size());
+            }
+        }
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
         context->inputTokens = (int)inputTokens.size();
@@ -3310,10 +3491,15 @@ namespace fastllm {
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
         bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        HistoryCacheTrace("查询入口 模型自带恢复=%d 走通用历史缓存=%d saveHistoryChat=%d tokens=%zu",
+                          restoredNativeHistory ? 1 : 0, this->UseGenericHistoryCache() ? 1 : 0,
+                          this->saveHistoryChat ? 1 : 0, inputTokens.size());
 
         auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
                      pastKVCacheManager.Get(inputTokens);
+        HistoryCacheTrace("查询入口 取到记录=%d 可复用=%d token",
+                          cache.first != nullptr ? 1 : 0, cache.second);
         if (cache.first != nullptr && cache.second > 0) {
             int len = cache.second;
 
