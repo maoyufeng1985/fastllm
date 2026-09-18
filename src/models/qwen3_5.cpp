@@ -9873,7 +9873,21 @@ namespace fastllm {
         }
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
         if (snapshotCount > 0 && currentLen % interval != 0) {
-            return false;
+            // 按 interval 的网格限流快照是为了不把快照池塞满。但提示词最后一个页边界 A
+            // 是后续轮次唯一真正用得上的复用点：分块把 A 之后那点尾巴留给下一轮，下一轮
+            // 复用的就是 A。提示词总长几乎不落在网格上，于是 A 不是 interval 的倍数，
+            // 会被这条门静默拦掉，"让末块停在 A"的收益一个也拿不到（实测：冷启动 15866
+            // 只记到 14336，A=15744 没记）。
+            // 只给这个页边界开一个口子，网格对其余边界照旧生效；maxPerRequest/maxRecords
+            // 仍然兜底。prefillRemaining > 0 把它限定在"分块 prefill 的中间块"上，
+            // 这样解码阶段（prefillRemaining == 0）的行为完全不变。
+            const int lastBoundary =
+                ((int)context->allTokens.size() / pageLen) * pageLen;
+            if (context->prefillRemaining <= 0 || currentLen != lastBoundary) {
+                return false;
+            }
+            Qwen35PrefixTrace("record 放行末页边界: currentLen=%d lastBoundary=%d interval=%d",
+                              currentLen, lastBoundary, interval);
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
         if (requestId <= 0) {

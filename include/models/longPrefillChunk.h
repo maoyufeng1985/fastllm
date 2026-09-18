@@ -78,6 +78,26 @@ inline int SelectPrefillChunkLen(const ResponseContext *ctx,
     }
     // seqLen==1 is the decode / CUDA-graph path. A leftover-1 last
     // chunk, or a 1-token leftover budget, must not look like decode.
+    // 线性注意力快照只能落在页边界上，所以让"最后一块"停在提示词的最后一个整页边界 A，
+    // 而不是停在总长上。否则 A 之后最多 pageLen-1 个 token 的尾巴每轮都要重算，
+    // 而且它只能以小分块跑（实测 880 tokens/s 对 2400+），正好压在首字延迟上。
+    // 必须限定 prefillRemaining > 0：只有被分块的请求才有"下一轮"去吃掉尾巴。
+    // 未分块的一次性 prefill（prefillRemaining == 0）里 remaining 就是 currentTokens.size()，
+    // 照截不误会把 A..total 的尾巴静默丢掉，模型看到的是被截断的提示词（实测过）。
+    if (curLen == remaining && ctx->prefillRemaining > 0) {
+        const int total = (int)ctx->allTokens.size();
+        const int fed = total - remaining;
+        const int pageLen = fastllm::GetPageLen();
+        const int lastBoundary = (total / pageLen) * pageLen;
+        const int alignedLen = lastBoundary - fed;
+        const int tailLen = remaining - alignedLen;
+        // 尾巴必须 >= 2：剩下 1 个 token 的尾巴会撞上下面两道 seqLen==1 守卫，
+        // 要么被丢掉要么被当成解码步。alignedLen <= 1 同理。
+        if (pageLen > 1 && total > 0 && fed >= 0 && (total % pageLen) != 0 &&
+            alignedLen > 1 && alignedLen < curLen && tailLen >= 2) {
+            curLen = alignedLen;
+        }
+    }
     if (curLen == 1 && remaining > 1) {
         return 0;
     }
